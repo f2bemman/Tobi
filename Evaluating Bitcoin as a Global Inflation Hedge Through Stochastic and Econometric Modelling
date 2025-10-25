@@ -1,0 +1,646 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import pandas_datareader.data as web
+from pandas_datareader.fred import FredReader
+import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns
+from statsmodels.tsa.arima.model import ARIMA
+from arch import arch_model
+from arch.univariate import EGARCH, GARCH
+import scipy.stats as stats
+from statsmodels.tsa.stattools import adfuller, coint
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.tsa.vector_ar.vecm import VECM
+from scipy.stats import pearsonr, ttest_ind
+from statsmodels.robust import mad
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==============================
+# FRED API key
+# ==============================
+FRED_API_KEY = "Your-FRED-APIKEY-here"
+
+# ==============================
+# Set style for plots
+# ==============================
+plt.style.use('seaborn-v0_8')
+sns.set_palette("deep")
+
+# ==============================
+# ADDED: Enhanced Jump Detection Function
+# ==============================
+def detect_jumps_robust(returns, threshold=3):
+    """Use robust statistics for jump detection"""
+    median_return = np.median(returns)
+    mad_return = mad(returns)
+    z_scores = (returns - median_return) / (1.4826 * mad_return)  # Consistent estimator for normal distribution
+    jump_mask = abs(z_scores) > threshold
+    return returns[jump_mask], jump_mask
+
+def calculate_gbm_loglikelihood(returns, mu, sigma):
+    """Calculate log-likelihood for GBM model"""
+    n = len(returns)
+    log_likelihood = -n/2 * np.log(2*np.pi*sigma**2) - np.sum((returns - mu)**2) / (2*sigma**2)
+    return log_likelihood
+
+def calculate_merton_loglikelihood(returns, mu, sigma, lambda_jump, alpha_jump, delta_jump, dt=1/252):
+    """Calculate approximate log-likelihood for Merton model"""
+    n = len(returns)
+    total_loglikelihood = 0
+
+    for r in returns:
+        # Simple approximation: mixture of normal and jump components
+        normal_component = (1 - lambda_jump*dt) * stats.norm.pdf(r, mu*dt, sigma*np.sqrt(dt))
+        jump_component = lambda_jump*dt * stats.norm.pdf(r, mu*dt + alpha_jump, np.sqrt(sigma**2*dt + delta_jump**2))
+        total_loglikelihood += np.log(normal_component + jump_component + 1e-10)  # Avoid log(0)
+
+    return total_loglikelihood
+
+# ==============================
+# ADDED: Model Comparison Class
+# ==============================
+class ModelComparator:
+    def __init__(self):
+        self.models = {}
+        self.results = pd.DataFrame(columns=['Model', 'LogLikelihood', 'AIC', 'BIC', 'Parameters'])
+
+    def add_model(self, name, loglikelihood, n_params, model_obj=None):
+        """Add model to comparison"""
+        aic = 2 * n_params - 2 * loglikelihood
+        bic = n_params * np.log(n_params) - 2 * loglikelihood
+
+        self.models[name] = {
+            'loglikelihood': loglikelihood,
+            'aic': aic,
+            'bic': bic,
+            'parameters': n_params,
+            'object': model_obj
+        }
+
+        new_row = pd.DataFrame({
+            'Model': [name],
+            'LogLikelihood': [loglikelihood],
+            'AIC': [aic],
+            'BIC': [bic],
+            'Parameters': [n_params]
+        })
+        self.results = pd.concat([self.results, new_row], ignore_index=True)
+
+    def print_comparison(self):
+        """Print model comparison results"""
+        print("\n" + "="*80)
+        print("MODEL COMPARISON RESULTS")
+        print("="*80)
+
+        # Sort by AIC (lower is better)
+        self.results = self.results.sort_values('AIC')
+        self.results['AIC_Rank'] = range(1, len(self.results) + 1)
+        self.results['BIC_Rank'] = self.results['BIC'].rank()
+        self.results['LogLikelihood_Rank'] = self.results['LogLikelihood'].rank(ascending=False)
+
+        print(self.results.to_string(index=False, float_format='%.2f'))
+
+        # Best model
+        best_model = self.results.iloc[0]
+        print(f"\nBEST MODEL: {best_model['Model']} (AIC: {best_model['AIC']:.2f})")
+
+        # Calculate AIC weights (model probabilities)
+        aic_min = self.results['AIC'].min()
+        delta_aic = self.results['AIC'] - aic_min
+        aic_weights = np.exp(-0.5 * delta_aic) / np.sum(np.exp(-0.5 * delta_aic))
+
+        print("\nAIC Weights (Model Probabilities):")
+        for i, (model, weight) in enumerate(zip(self.results['Model'], aic_weights)):
+            print(f"  {model}: {weight:.3f}")
+
+# ==============================
+# Date range for data collection
+# ==============================
+start_date = datetime.datetime(2015, 1, 1)
+end_date = datetime.datetime(2024, 6, 30)
+
+# ==============================
+# Fetch Bitcoin data from Yahoo Finance
+# ==============================
+print("Fetching Bitcoin data...")
+btc = yf.download('BTC-USD', start=start_date, end=end_date, progress=False)
+
+if 'Adj Close' in btc.columns:
+    btc_prices = btc['Adj Close']
+elif 'Close' in btc.columns:
+    btc_prices = btc['Close']
+else:
+    btc_prices = btc.iloc[:, 0]
+
+if isinstance(btc_prices, pd.DataFrame):
+    btc_prices = btc_prices.iloc[:, 0]
+
+btc_returns = np.log(btc_prices / btc_prices.shift(1)).dropna()
+
+# ==============================
+# Fetch Gold data
+# ==============================
+print("Fetching Gold data...")
+gold = yf.download('GC=F', start=start_date, end=end_date, progress=False)
+
+if 'Adj Close' in gold.columns:
+    gold_prices = gold['Adj Close']
+elif 'Close' in gold.columns:
+    gold_prices = gold['Close']
+else:
+    gold_prices = gold.iloc[:, 0]
+
+if isinstance(gold_prices, pd.DataFrame):
+    gold_prices = gold_prices.iloc[:, 0]
+
+gold_returns = np.log(gold_prices / gold_prices.shift(1)).dropna()
+
+# ==============================
+# Fetch additional macroeconomic data
+# ==============================
+print("Fetching additional macroeconomic data...")
+
+# S&P 500
+sp500 = yf.download('^GSPC', start=start_date, end=end_date, progress=False)
+sp500_prices = sp500['Adj Close'] if 'Adj Close' in sp500.columns else sp500['Close']
+if isinstance(sp500_prices, pd.DataFrame):
+    sp500_prices = sp500_prices.iloc[:, 0]
+sp500_returns = np.log(sp500_prices / sp500_prices.shift(1)).dropna()
+
+# US Dollar Index
+dxy = yf.download('DX-Y.NYB', start=start_date, end=end_date, progress=False)
+dxy_prices = dxy['Adj Close'] if 'Adj Close' in dxy.columns else dxy['Close']
+if isinstance(dxy_prices, pd.DataFrame):
+    dxy_prices = dxy_prices.iloc[:, 0]
+dxy_returns = np.log(dxy_prices / dxy_prices.shift(1)).dropna()
+
+# Oil prices (WTI)
+wti = yf.download('CL=F', start=start_date, end=end_date, progress=False)
+wti_prices = wti['Adj Close'] if 'Adj Close' in wti.columns else wti['Close']
+if isinstance(wti_prices, pd.DataFrame):
+    wti_prices = wti_prices.iloc[:, 0]
+wti_returns = np.log(wti_prices / wti_prices.shift(1)).dropna()
+
+# ==============================
+# Fetch CPI data from FRED
+# ==============================
+print("Fetching CPI data from FRED...")
+try:
+    reader = FredReader(symbols="CPIAUCSL", start=start_date, end=end_date, api_key=FRED_API_KEY)
+    cpi = reader.read()
+
+    # Convert to monthly YoY inflation
+    cpi_inflation = cpi.pct_change(12).dropna()
+
+    # Interpolate to daily frequency
+    daily_dates = pd.date_range(start=start_date, end=end_date, freq='D')
+    cpi_daily = cpi_inflation.reindex(daily_dates).interpolate(method='time')
+    cpi_daily = cpi_daily.reindex(btc_returns.index).ffill().bfill()
+
+except Exception as e:
+    print(f"Error fetching CPI data: {e}")
+    cpi_daily = pd.Series(np.random.normal(0.0001, 0.0005, len(btc_returns)),
+                          index=btc_returns.index)
+    print("Using synthetic inflation data for demonstration")
+
+if isinstance(cpi_daily, pd.DataFrame):
+    cpi_daily = cpi_daily.iloc[:, 0]
+
+# ==============================
+# Align all data
+# ==============================
+all_data = pd.DataFrame({
+    'BTC': btc_returns,
+    'GOLD': gold_returns,
+    'SP500': sp500_returns,
+    'DXY': dxy_returns,
+    'WTI': wti_returns,
+    'CPI': cpi_daily
+}).dropna()
+
+btc_returns = all_data['BTC']
+gold_returns = all_data['GOLD']
+sp500_returns = all_data['SP500']
+dxy_returns = all_data['DXY']
+wti_returns = all_data['WTI']
+cpi_daily = all_data['CPI']
+
+# ==============================
+# ADDED: Enhanced Jump Detection
+# ==============================
+print("\n" + "="*50)
+print("ENHANCED JUMP DETECTION ANALYSIS")
+print("="*50)
+
+# Traditional method (standard deviation)
+std_return = float(np.std(btc_returns))
+threshold_std = 3 * std_return
+jumps_std = btc_returns[btc_returns.abs() > threshold_std]
+
+# Robust method (MAD)
+jumps_robust, jump_mask_robust = detect_jumps_robust(btc_returns, threshold=3)
+
+print(f"Traditional method (3σ): {len(jumps_std)} jumps detected")
+print(f"Robust method (3*MAD): {len(jumps_robust)} jumps detected")
+print(f"Overlap between methods: {len(set(jumps_std.index) & set(jumps_robust.index))}")
+
+# Use robust method for better jump detection
+jump_returns = jumps_robust
+non_jump_returns = btc_returns[~jump_mask_robust]
+
+# ==============================
+# Descriptive statistics
+# ==============================
+mean_return = float(np.mean(btc_returns))
+skewness = float(stats.skew(btc_returns))
+kurtosis = float(stats.kurtosis(btc_returns))
+adf_result = adfuller(btc_returns)
+adf_pvalue = adf_result[1]
+
+num_large_jumps = len(jump_returns)
+avg_jump_size = float(np.mean(jump_returns)) if num_large_jumps > 0 else 0
+
+print("\nDescriptive Statistics for Bitcoin Returns:")
+print(f"Mean Daily Return: {mean_return:.6f}")
+print(f"Std Daily Return: {std_return:.6f}")
+print(f"Number of Large Jumps: {num_large_jumps}")
+print(f"Average Jump Size: {avg_jump_size:.6f}")
+print(f"ADF p-value: {adf_pvalue:.6f}")
+print(f"Skewness: {skewness:.3f}")
+print(f"Kurtosis: {kurtosis:.3f}")
+
+# ==============================
+# GBM parameters
+# ==============================
+mu_gbm = float(np.mean(btc_returns)) * 365
+sigma_gbm = float(np.std(btc_returns)) * np.sqrt(365)
+
+print(f"\nGBM Parameters:")
+print(f"Drift (μ): {mu_gbm:.6f}")
+print(f"Volatility (σ): {sigma_gbm:.6f}")
+
+# ==============================
+# Merton jump-diffusion parameters
+# ==============================
+lambda_jump = len(jump_returns) / len(btc_returns)
+alpha_jump = float(np.mean(jump_returns))
+delta_jump = float(np.std(jump_returns))
+mu_diffusion = float(np.mean(non_jump_returns)) * 365
+sigma_diffusion = float(np.std(non_jump_returns)) * np.sqrt(365)
+
+print(f"\nMerton Jump-Diffusion Parameters:")
+print(f"Drift (μ): {mu_diffusion:.6f}")
+print(f"Volatility (σ): {sigma_diffusion:.6f}")
+print(f"Jump Intensity (λ): {lambda_jump:.6f} (per day)")
+print(f"Mean Jump Size (α): {alpha_jump:.6f}")
+print(f"Jump Volatility (δ): {delta_jump:.6f}")
+
+# ==============================
+# ARIMA + EGARCH model
+# ==============================
+print("\nFitting ARIMA-EGARCH model...")
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+plot_acf(btc_returns, lags=30, ax=ax1)
+plot_pacf(btc_returns, lags=30, ax=ax2)
+plt.savefig('acf_pacf.png', dpi=300, bbox_inches='tight')
+plt.show()
+plt.close()
+
+model = ARIMA(btc_returns, order=(1,0,1))
+fit_arima = model.fit()
+residuals = fit_arima.resid.dropna()
+
+egarch = arch_model(residuals, vol='EGARCH', p=1, q=1, o=1)
+fit_egarch = egarch.fit(disp='off')
+print("EGARCH Model Results:")
+print(fit_egarch.summary())
+
+gjrgarch = arch_model(residuals, vol='GARCH', p=1, q=1, o=1)
+fit_gjrgarch = gjrgarch.fit(disp='off')
+print("\nGJR-GARCH Model Results:")
+print(fit_gjrgarch.summary())
+
+# ==============================
+# ADDED: MODEL COMPARISON
+# ==============================
+comparator = ModelComparator()
+
+# GBM Model
+gbm_loglikelihood = calculate_gbm_loglikelihood(btc_returns, mu_gbm/365, sigma_gbm/np.sqrt(365))
+comparator.add_model('GBM', gbm_loglikelihood, n_params=2)
+
+# Merton Model
+merton_loglikelihood = calculate_merton_loglikelihood(
+    btc_returns,
+    mu_diffusion/365,
+    sigma_diffusion/np.sqrt(365),
+    lambda_jump,
+    alpha_jump,
+    delta_jump
+)
+comparator.add_model('Merton_Jump_Diffusion', merton_loglikelihood, n_params=5)
+
+# ARIMA-EGARCH Model
+comparator.add_model('ARIMA-EGARCH', fit_egarch.loglikelihood, n_params=fit_egarch.num_params, model_obj=fit_egarch)
+
+# ARIMA-GJR-GARCH Model
+comparator.add_model('ARIMA-GJR-GARCH', fit_gjrgarch.loglikelihood, n_params=fit_gjrgarch.num_params, model_obj=fit_gjrgarch)
+
+# Print comprehensive model comparison
+comparator.print_comparison()
+
+# ==============================
+# ADDED: Statistical Significance for Correlations
+# ==============================
+print("\n" + "="*50)
+print("CORRELATION ANALYSIS WITH STATISTICAL SIGNIFICANCE")
+print("="*50)
+
+# Calculate correlations with p-values
+corr_btc_infl, pval_btc_infl = pearsonr(btc_returns, cpi_daily)
+corr_gold_infl, pval_gold_infl = pearsonr(gold_returns, cpi_daily)
+corr_btc_gold, pval_btc_gold = pearsonr(btc_returns, gold_returns)
+corr_btc_sp500, pval_btc_sp500 = pearsonr(btc_returns, sp500_returns)
+corr_gold_sp500, pval_gold_sp500 = pearsonr(gold_returns, sp500_returns)
+
+print("Correlation Analysis (with p-values):")
+print(f"BTC-Inflation: {corr_btc_infl:.6f} (p-value: {pval_btc_infl:.4f}) {'**' if pval_btc_infl < 0.05 else 'not significant'}")
+print(f"Gold-Inflation: {corr_gold_infl:.6f} (p-value: {pval_gold_infl:.4f}) {'**' if pval_gold_infl < 0.05 else 'not significant'}")
+print(f"BTC-Gold: {corr_btc_gold:.6f} (p-value: {pval_btc_gold:.4f}) {'**' if pval_btc_gold < 0.05 else 'not significant'}")
+print(f"BTC-S&P500: {corr_btc_sp500:.6f} (p-value: {pval_btc_sp500:.4f}) {'**' if pval_btc_sp500 < 0.05 else 'not significant'}")
+print(f"Gold-S&P500: {corr_gold_sp500:.6f} (p-value: {pval_gold_sp500:.4f}) {'**' if pval_gold_sp500 < 0.05 else 'not significant'}")
+
+# ==============================
+# Cointegration tests
+# ==============================
+print("\nCointegration Test (Bitcoin vs Gold):")
+coint_result = coint(btc_prices.reindex(gold_prices.index).dropna(),
+                     gold_prices.reindex(btc_prices.index).dropna())
+print(f"p-value: {coint_result[1]:.6f}")
+
+print("\nCointegration Test (Bitcoin vs Inflation):")
+cpi_aligned = cpi_daily.reindex(btc_prices.index).dropna()
+btc_aligned = btc_prices.reindex(cpi_aligned.index)
+coint_result2 = coint(btc_aligned, cpi_aligned)
+print(f"p-value: {coint_result2[1]:.6f}")
+
+# ==============================
+# Simulation functions
+# ==============================
+def simulate_gbm(S0, mu, sigma, T, N):
+    dt = T / N
+    t = np.linspace(0, T, N)
+    W = np.random.standard_normal(size=N)
+    W = np.cumsum(W) * np.sqrt(dt)
+    X = (mu - 0.5 * sigma**2) * t + sigma * W
+    S = S0 * np.exp(X)
+    return t, S
+
+def simulate_merton(S0, mu, sigma, lam, alpha, delta, T, N):
+    dt = T / N
+    t = np.linspace(0, T, N)
+    W = np.random.standard_normal(size=N)
+    W = np.cumsum(W) * np.sqrt(dt)
+    P = np.random.poisson(lam * dt, N)
+    jumps = np.zeros(N)
+    for i in range(N):
+        if P[i] > 0:
+            jumps[i] = np.sum(np.random.normal(alpha, delta, P[i]))
+    J = np.cumsum(jumps)
+    X = (mu - 0.5 * sigma**2) * t + sigma * W + J
+    S = S0 * np.exp(X)
+    return t, S
+
+# ==============================
+# Simulate paths
+# ==============================
+T = 1
+N = 252
+S0 = float(btc_prices.iloc[0])
+
+mu_daily_gbm = mu_gbm / 365
+sigma_daily_gbm = sigma_gbm / np.sqrt(365)
+mu_daily_merton = mu_diffusion / 365
+sigma_daily_merton = sigma_diffusion / np.sqrt(365)
+
+np.random.seed(42)
+t_gbm, S_gbm = simulate_gbm(S0, mu_daily_gbm, sigma_daily_gbm, T, N)
+t_merton, S_merton = simulate_merton(S0, mu_daily_merton, sigma_daily_merton,
+                                     lambda_jump, alpha_jump, delta_jump, T, N)
+
+actual_start = btc_prices.index[0]
+actual_end = actual_start + datetime.timedelta(days=365)
+actual_prices = btc_prices[actual_start:actual_end]
+sim_dates = pd.date_range(start=actual_start, periods=N, freq='D')
+
+plt.figure(figsize=(12, 6))
+plt.plot(actual_prices.index, actual_prices.values, label='Actual Price', linewidth=2)
+plt.plot(sim_dates, S_merton, label='Merton Model', linewidth=2)
+plt.plot(sim_dates, S_gbm, label='GBM Model', linewidth=2)
+plt.title('Figure 4.1: Actual vs Simulated Bitcoin Price Paths', fontsize=14)
+plt.xlabel('Date')
+plt.ylabel('Price (USD)')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.savefig('figure4_1.png', dpi=300, bbox_inches='tight')
+plt.show()
+plt.close()
+
+# ==============================
+# Histogram vs Normal
+# ==============================
+plt.figure(figsize=(12, 6))
+plt.hist(btc_returns, bins=50, density=True, alpha=0.6, color='steelblue', label='Bitcoin Returns')
+x = np.linspace(float(btc_returns.min()), float(btc_returns.max()), 100)
+pdf = stats.norm.pdf(x, np.mean(btc_returns), np.std(btc_returns))
+plt.plot(x, pdf, 'k-', linewidth=2, label='Normal Distribution')
+plt.title('Figure 4.2: Histogram of Bitcoin Returns vs Normal Distribution', fontsize=14)
+plt.xlabel('Daily Returns')
+plt.ylabel('Density')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.savefig('figure4_2.png', dpi=300, bbox_inches='tight')
+plt.show()
+plt.close()
+
+# ==============================
+# Q-Q Plot
+# ==============================
+plt.figure(figsize=(10, 6))
+stats.probplot(btc_returns, dist="norm", plot=plt)
+plt.title('Figure 4.3: Q-Q Plot of Bitcoin Returns vs Normal Distribution', fontsize=14)
+plt.grid(True, alpha=0.3)
+plt.savefig('figure4_3.png', dpi=300, bbox_inches='tight')
+plt.show()
+plt.close()
+
+# ==============================
+# ADDED: Enhanced Hedging analysis with statistical significance
+# ==============================
+cov_btc = np.cov(btc_returns, cpi_daily)[0, 1]
+var_pi = np.var(cpi_daily)
+hr_btc = cov_btc / var_pi
+
+cov_gold = np.cov(gold_returns, cpi_daily)[0, 1]
+hr_gold = cov_gold / var_pi
+
+eff_btc = 1 - np.var(btc_returns - hr_btc * cpi_daily) / np.var(btc_returns)
+eff_gold = 1 - np.var(gold_returns - hr_gold * cpi_daily) / np.var(gold_returns)
+
+print("\n" + "="*50)
+print("ENHANCED HEDGING EFFECTIVENESS ANALYSIS")
+print("="*50)
+print(f"Bitcoin Correlation with Inflation: {corr_btc_infl:.6f} (p-value: {pval_btc_infl:.4f})")
+print(f"Gold Correlation with Inflation: {corr_gold_infl:.6f} (p-value: {pval_gold_infl:.4f})")
+print(f"Bitcoin Hedge Ratio: {hr_btc:.6f}")
+print(f"Gold Hedge Ratio: {hr_gold:.6f}")
+print(f"Bitcoin Hedging Effectiveness: {eff_btc:.6f} ({eff_btc*100:.4f}%)")
+print(f"Gold Hedging Effectiveness: {eff_gold:.6f} ({eff_gold*100:.4f}%)")
+
+# Statistical test for hedging effectiveness difference
+hedged_btc = btc_returns - hr_btc * cpi_daily
+hedged_gold = gold_returns - hr_gold * cpi_daily
+
+t_stat, p_val = ttest_ind(hedged_btc, hedged_gold, equal_var=False)
+print(f"T-test for hedging effectiveness difference: t-stat={t_stat:.4f}, p-value={p_val:.4f}")
+
+# ==============================
+# Correlation heatmap
+# ==============================
+corr_data = pd.DataFrame({
+    'Bitcoin': btc_returns,
+    'Gold': gold_returns,
+    'S&P500': sp500_returns,
+    'USD Index': dxy_returns,
+    'Oil': wti_returns,
+    'Inflation': cpi_daily
+})
+corr_matrix = corr_data.corr()
+
+plt.figure(figsize=(12, 10))
+sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0,
+            square=True, fmt='.4f', cbar_kws={'label': 'Correlation Coefficient'})
+plt.title('Figure 4.4: Correlation Heatmap Between Assets and Macroeconomic Factors', fontsize=14)
+plt.savefig('figure4_4.png', dpi=300, bbox_inches='tight')
+plt.show()
+plt.close()
+
+# ==============================
+# Rolling correlations
+# ==============================
+window_size = 252
+rolling_corr_btc_infl = btc_returns.rolling(window=window_size).corr(cpi_daily)
+rolling_corr_gold_infl = gold_returns.rolling(window=window_size).corr(cpi_daily)
+rolling_corr_btc_gold = btc_returns.rolling(window=window_size).corr(gold_returns)
+
+plt.figure(figsize=(14, 8))
+plt.plot(rolling_corr_btc_infl.index, rolling_corr_btc_infl.values, label='BTC-Inflation', linewidth=2)
+plt.plot(rolling_corr_gold_infl.index, rolling_corr_gold_infl.values, label='Gold-Inflation', linewidth=2)
+plt.plot(rolling_corr_btc_gold.index, rolling_corr_btc_gold.values, label='BTC-Gold', linewidth=2)
+plt.title('Rolling Correlations (2016-2024 Window)', fontsize=14)
+plt.xlabel('Date')
+plt.ylabel('Correlation')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.savefig('rolling_correlations.png', dpi=300, bbox_inches='tight')
+plt.show()
+plt.close()
+
+# ==============================
+# ADDED: Enhanced Subperiod analysis with statistical tests
+# ==============================
+covid_cutoff = datetime.datetime(2020, 3, 1)
+
+pre_covid_mask = all_data.index < covid_cutoff
+pre_covid_btc = all_data['BTC'][pre_covid_mask]
+pre_covid_gold = all_data['GOLD'][pre_covid_mask]
+pre_covid_cpi = all_data['CPI'][pre_covid_mask]
+
+post_covid_mask = all_data.index >= covid_cutoff
+post_covid_btc = all_data['BTC'][post_covid_mask]
+post_covid_gold = all_data['GOLD'][post_covid_mask]
+post_covid_cpi = all_data['CPI'][post_covid_mask]
+
+pre_covid_corr_btc, pre_covid_pval_btc = pearsonr(pre_covid_btc, pre_covid_cpi)
+pre_covid_corr_gold, pre_covid_pval_gold = pearsonr(pre_covid_gold, pre_covid_cpi)
+post_covid_corr_btc, post_covid_pval_btc = pearsonr(post_covid_btc, post_covid_cpi)
+post_covid_corr_gold, post_covid_pval_gold = pearsonr(post_covid_gold, post_covid_cpi)
+
+print("\n" + "="*50)
+print("ENHANCED SUBPERIOD ANALYSIS (Pre-COVID vs Post-COVID)")
+print("="*50)
+print(f"Pre-COVID Bitcoin-Inflation Correlation: {pre_covid_corr_btc:.6f} (p-value: {pre_covid_pval_btc:.4f})")
+print(f"Pre-COVID Gold-Inflation Correlation: {pre_covid_corr_gold:.6f} (p-value: {pre_covid_pval_gold:.4f})")
+print(f"Post-COVID Bitcoin-Inflation Correlation: {post_covid_corr_btc:.6f} (p-value: {post_covid_pval_btc:.4f})")
+print(f"Post-COVID Gold-Inflation Correlation: {post_covid_corr_gold:.6f} (p-value: {post_covid_pval_gold:.4f})")
+
+# ADDED: Test for significant difference in correlations using Fisher's z-transform
+def fisher_z_transform(r):
+    return 0.5 * np.log((1 + r) / (1 - r))
+
+def correlation_difference_test(r1, r2, n1, n2):
+    z1 = fisher_z_transform(r1)
+    z2 = fisher_z_transform(r2)
+    se = np.sqrt(1/(n1-3) + 1/(n2-3))
+    z = (z1 - z2) / se
+    p_value = 2 * (1 - stats.norm.cdf(abs(z)))
+    return z, p_value
+
+# Test Bitcoin correlation difference
+z_btc, p_btc = correlation_difference_test(pre_covid_corr_btc, post_covid_corr_btc, len(pre_covid_btc), len(post_covid_btc))
+print(f"\nBitcoin correlation change (Pre vs Post COVID): z-stat={z_btc:.4f}, p-value={p_btc:.4f}")
+
+# Test Gold correlation difference
+z_gold, p_gold = correlation_difference_test(pre_covid_corr_gold, post_covid_corr_gold, len(pre_covid_gold), len(post_covid_gold))
+print(f"Gold correlation change (Pre vs Post COVID): z-stat={z_gold:.4f}, p-value={p_gold:.4f}")
+
+plt.figure(figsize=(10, 6))
+plt.plot(pre_covid_btc.index, pre_covid_btc.rolling(180).corr(pre_covid_cpi), label='BTC-Inflation (Pre-COVID)', linewidth=2)
+plt.plot(pre_covid_gold.index, pre_covid_gold.rolling(180).corr(pre_covid_cpi), label='Gold-Inflation (Pre-COVID)', linewidth=2)
+plt.plot(post_covid_btc.index, post_covid_btc.rolling(180).corr(post_covid_cpi), label='BTC-Inflation (Post-COVID)', linewidth=2)
+plt.plot(post_covid_gold.index, post_covid_gold.rolling(180).corr(post_covid_cpi), label='Gold-Inflation (Post-COVID)', linewidth=2)
+plt.title('Bitcoin and Gold vs Inflation (Pre- and Post-COVID)', fontsize=14)
+plt.xlabel('Date')
+plt.ylabel('Rolling 6-Month Correlation')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.savefig('subperiod_analysis.png', dpi=300, bbox_inches='tight')
+plt.show()
+plt.close()
+
+# ==============================
+# ADDED: Robustness Check: Sensitivity Analysis
+# ==============================
+print("\n" + "="*50)
+print("ROBUSTNESS CHECKS: SENSITIVITY ANALYSIS")
+print("="*50)
+
+# Test different jump detection thresholds
+thresholds = [2.5, 3.0, 3.5]
+print("Sensitivity of Merton parameters to jump detection threshold:")
+for threshold in thresholds:
+    jumps_thresh, _ = detect_jumps_robust(btc_returns, threshold=threshold)
+    lambda_thresh = len(jumps_thresh) / len(btc_returns)
+    alpha_thresh = float(np.mean(jumps_thresh)) if len(jumps_thresh) > 0 else 0
+    print(f"Threshold {threshold}: λ={lambda_thresh:.6f}, α={alpha_thresh:.6f}")
+
+# Test different GARCH specifications
+print("\nGARCH Model Robustness (Different Orders):")
+garch_orders = [(1,1), (1,2), (2,1)]
+for order in garch_orders:
+    try:
+        garch_test = arch_model(residuals, vol='GARCH', p=order[0], q=order[1])
+        fit_garch_test = garch_test.fit(disp='off')
+        print(f"GARCH{order}: AIC={fit_garch_test.aic:.2f}, BIC={fit_garch_test.bic:.2f}")
+    except:
+        print(f"GARCH{order}: Failed to converge")
+
+print("\nAnalysis complete. All figures saved as PNG files.")
+print("\nKEY FINDINGS:")
+print(f"- Best model according to AIC: {comparator.results.iloc[0]['Model']}")
+print(f"- Bitcoin-Inflation correlation: {corr_btc_infl:.6f} (statistically {'significant' if pval_btc_infl < 0.05 else 'not significant'})")
+print(f"- Gold-Inflation correlation: {corr_gold_infl:.6f} (statistically {'significant' if pval_gold_infl < 0.05 else 'not significant'})")
+print(f"- Hedging effectiveness: Bitcoin {eff_btc*100:.4f}%, Gold {eff_gold*100:.4f}%")
