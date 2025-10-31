@@ -1,15 +1,44 @@
+"""
+Bitcoin Price Modeling and Analysis: Jump Diffusion vs Geometric Brownian Motion
+Comprehensive analysis comparing stochastic process models for Bitcoin pricing
+with hedging effectiveness and macroeconomic correlations.
+"""
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from jumpdiff import jd_process
 import matplotlib.pyplot as plt
 import warnings
+import pandas_datareader.data as web
+from pandas_datareader.fred import FredReader
+import datetime
+import seaborn as sns
+from statsmodels.tsa.arima.model import ARIMA
+from arch import arch_model
+from arch.univariate import EGARCH, GARCH
+import scipy.stats as stats
+from statsmodels.tsa.stattools import adfuller, coint
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from scipy.stats import pearsonr, ttest_ind
+from statsmodels.robust import mad
+from scipy.optimize import minimize
 
+# ==============================
+# CONFIGURATION AND SETUP
+# ==============================
+
+# Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
 # Set random seed for reproducibility
 np.random.seed(42)
 
+# FRED API key for economic data
+FRED_API_KEY = "f04f41b6498c862d900d20056c95539a"
+
+# Set visualization style
+plt.style.use('seaborn-v0_8')
+sns.set_palette("deep")
 
 # ==============================
 # INTRODUCTORY CHARTS - ADDED SECTION
@@ -20,22 +49,7 @@ def create_introductory_charts():
 
     print("Creating introductory charts...")
 
-    # Chart 1: Bitcoin Price Chart
-    btc_data = yf.download("BTC-USD", start="2015-01-01", end="2024-06-30", progress=False)
-    btc_prices = btc_data['Close'] if 'Close' in btc_data.columns else btc_data['Adj Close']
-
-    plt.figure(figsize=(12, 6))
-    plt.plot(btc_prices.index, btc_prices.values, color='#FF9900', linewidth=2)
-    plt.title('Figure 2.3: Bitcoin Price Evolution (January 2015 - June 2024)', fontsize=14, fontweight='bold')
-    plt.xlabel('Date')
-    plt.ylabel('Price (USD)')
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig('figure2.3_bitcoin_price.png', dpi=300, bbox_inches='tight')
-    plt.show()
-    plt.close()
-
-    # Chart 2 & 3: US CPI and Inflation Charts with ACCURATE DATA
+    # Chart 1: US CPI Chart
     print("Creating accurate CPI and inflation charts...")
 
     # Create ACCURATE CPI data based on actual historical values
@@ -68,7 +82,7 @@ def create_introductory_charts():
 
     cpi_data = pd.DataFrame({'CPIAUCSL': actual_cpi_values}, index=dates)
 
-    # Chart 2: US CPI Chart
+    # Figure 2.1: US CPI Chart
     plt.figure(figsize=(12, 6))
     plt.plot(cpi_data.index, cpi_data['CPIAUCSL'], color='#2E86AB', linewidth=2)
     plt.title('Figure 2.1: US Consumer Price Index (CPI) (January 2015 - June 2024)', fontsize=14, fontweight='bold')
@@ -89,11 +103,12 @@ def create_introductory_charts():
     plt.show()
     plt.close()
 
-    # Chart 3: US Year-over-Year Inflation Rate with ACCURATE DATA
+    # Chart 2: US Year-over-Year Inflation Rate with ACCURATE DATA
     # Calculate YoY inflation rate properly
     cpi_yoy = cpi_data.pct_change(12) * 100  # 12 months for YoY
     cpi_yoy = cpi_yoy.dropna()  # Remove NaN values from the beginning
 
+    # Figure 2.2: US Inflation Rate
     plt.figure(figsize=(12, 6))
     plt.plot(cpi_yoy.index, cpi_yoy['CPIAUCSL'], color='#A23B72', linewidth=2)
     plt.title('Figure 2.2: US Year-over-Year Inflation Rate (January 2015 - June 2024)', fontsize=14, fontweight='bold')
@@ -120,7 +135,23 @@ def create_introductory_charts():
                  arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0'))
 
     plt.tight_layout()
-    plt.savefig('figure2.2_inflation_rate.png', dpi=300, bbox_inches='tight')
+    plt.savefig('figure2_2_inflation_rate.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    plt.close()
+
+    # Chart 3: Bitcoin Price Chart
+    # Figure 2.3: Bitcoin Price
+    btc_data = yf.download("BTC-USD", start="2015-01-01", end="2024-06-30", progress=False)
+    btc_prices = btc_data['Close'] if 'Close' in btc_data.columns else btc_data['Adj Close']
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(btc_prices.index, btc_prices.values, color='#FF9900', linewidth=2)
+    plt.title('Figure 2.3: Bitcoin Price Evolution (January 2015 - June 2024)', fontsize=14, fontweight='bold')
+    plt.xlabel('Date')
+    plt.ylabel('Price (USD)')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('figure2_3_bitcoin_price.png', dpi=300, bbox_inches='tight')
     plt.show()
     plt.close()
 
@@ -131,19 +162,31 @@ def create_introductory_charts():
 
     return cpi_data, cpi_yoy
 
-
 # Run introductory charts first
 print("CREATING INTRODUCTORY CHARTS")
 print("=" * 80)
 cpi_data, cpi_yoy = create_introductory_charts()
 
-
 # ==============================
-# DATA DOWNLOAD AND PROCESSING FUNCTIONS
+# DATA DOWNLOAD AND PREPROCESSING FUNCTIONS
 # ==============================
 
 def download_bitcoin_data(start_date, end_date):
-    """Download Bitcoin data with error handling"""
+    """
+    Download Bitcoin historical price data from Yahoo Finance.
+
+    Parameters:
+    -----------
+    start_date : str
+        Start date in 'YYYY-MM-DD' format
+    end_date : str
+        End date in 'YYYY-MM-DD' format
+
+    Returns:
+    --------
+    pandas.DataFrame or None
+        DataFrame with Bitcoin data or None if download fails
+    """
     try:
         data = yf.download("BTC-USD", start=start_date, end=end_date, progress=False)
         return data
@@ -151,9 +194,21 @@ def download_bitcoin_data(start_date, end_date):
         print(f"Error downloading data: {e}")
         return None
 
-
 def get_price_data(data):
-    """Extract price data from the downloaded dataframe"""
+    """
+    Extract and clean price data from downloaded dataframe.
+    Handles multiple dataframe structures and data formats.
+
+    Parameters:
+    -----------
+    data : pandas.DataFrame
+        Raw downloaded data with potential MultiIndex columns
+
+    Returns:
+    --------
+    pandas.Series
+        Cleaned price series
+    """
     if isinstance(data.columns, pd.MultiIndex):
         if 'Close' in data.columns.get_level_values(0):
             close_data = data['Close']
@@ -185,71 +240,384 @@ def get_price_data(data):
             else:
                 raise ValueError("No numeric columns found in data")
 
+    # Flatten and clean the price data
     prices = pd.Series(prices.values.flatten() if hasattr(prices.values, 'flatten') else prices.values)
     prices = pd.to_numeric(prices, errors='coerce')
     return prices
 
-
 # ==============================
-# PARAMETER ESTIMATION FUNCTIONS
+# ENHANCED PARAMETER ESTIMATION
 # ==============================
 
-def estimate_parameters(prices):
-    """Estimate parameters from historical data"""
+def estimate_gbm_parameters(prices, dt=1/365):
+    """
+    Comprehensive GBM parameter estimation from historical prices.
+
+    Parameters:
+    -----------
+    prices : pandas.Series
+        Historical price data
+    dt : float
+        Time step in years
+
+    Returns:
+    --------
+    dict
+        Dictionary containing all GBM parameters
+    """
+    # Calculate logarithmic returns
     log_returns = np.log(prices / prices.shift(1)).dropna()
 
-    # Annualize the parameters (assuming daily data)
-    mu_annual = log_returns.mean() * 365  # Changed to 365 for Bitcoin
-    sigma_annual = log_returns.std() * np.sqrt(365)  # Changed to 365 for Bitcoin
+    # Basic GBM parameters (annualized)
+    mu_daily = log_returns.mean()
+    sigma_daily = log_returns.std()
 
-    print(f"Estimated annual drift (mu): {mu_annual:.6f}")
-    print(f"Estimated annual volatility (sigma): {sigma_annual:.6f}")
-    print(f"Number of data points: {len(log_returns)}")
+    mu_annual = mu_daily / dt
+    sigma_annual = sigma_daily / np.sqrt(dt)
 
-    return log_returns, mu_annual, sigma_annual, prices.iloc[0]
+    # Maximum likelihood estimation for more robust parameters
+    def gbm_log_likelihood(params, returns, dt):
+        mu, sigma = params
+        n = len(returns)
+        if sigma <= 0:
+            return 1e10
+        log_likelihood = -n/2 * np.log(2 * np.pi * sigma**2 * dt) - np.sum((returns - (mu - 0.5*sigma**2)*dt)**2) / (2 * sigma**2 * dt)
+        return -log_likelihood  # Negative for minimization
 
+    # Initial guess
+    initial_guess = [mu_annual, sigma_annual]
+    bounds = [(mu_annual*0.5, mu_annual*2), (sigma_annual*0.5, sigma_annual*2)]
+
+    try:
+        result = minimize(gbm_log_likelihood, initial_guess, args=(log_returns.values, dt),
+                         bounds=bounds, method='L-BFGS-B')
+        mu_mle, sigma_mle = result.x
+    except:
+        mu_mle, sigma_mle = mu_annual, sigma_annual
+
+    # Additional statistics
+    volatility_annualized = sigma_annual
+    sharpe_ratio = mu_annual / sigma_annual if sigma_annual > 0 else 0
+
+    gbm_params = {
+        'mu_daily': mu_daily,
+        'sigma_daily': sigma_daily,
+        'mu_annual': mu_annual,
+        'sigma_annual': sigma_annual,
+        'mu_mle': mu_mle,
+        'sigma_mle': sigma_mle,
+        'volatility_annualized': volatility_annualized,
+        'sharpe_ratio': sharpe_ratio,
+        'initial_price': prices.iloc[0],
+        'final_price': prices.iloc[-1],
+        'total_return': (prices.iloc[-1] / prices.iloc[0] - 1),
+        'n_observations': len(log_returns)
+    }
+
+    return gbm_params, log_returns
+
+def estimate_jump_diffusion_parameters(returns, dt=1/365, threshold=3.0):
+    """
+    Comprehensive Jump Diffusion parameter estimation using robust methods.
+
+    Parameters:
+    -----------
+    returns : pandas.Series
+        Log returns series
+    dt : float
+        Time step in years
+    threshold : float
+        Threshold for jump detection
+
+    Returns:
+    --------
+    dict
+        Dictionary containing all Jump Diffusion parameters
+    """
+    # Robust jump detection using multiple methods
+    jumps_mad, jump_mask_mad = detect_jumps_robust(returns, threshold)
+    non_jumps_mad = returns[~jump_mask_mad]
+
+    # Method 2: Standard deviation approach
+    std_threshold = returns.std() * threshold
+    jump_mask_std = np.abs(returns) > std_threshold
+    jumps_std = returns[jump_mask_std]
+    non_jumps_std = returns[~jump_mask_std]
+
+    # Use robust MAD method as primary
+    jumps = jumps_mad
+    non_jumps = non_jumps_mad
+    jump_mask = jump_mask_mad
+
+    # Jump parameters (annualized)
+    n_jumps = len(jumps)
+    n_obs = len(returns)
+    jump_intensity = n_jumps / n_obs / dt  # Annual jump intensity (lambda)
+
+    if n_jumps > 0:
+        mean_jump_size = jumps.mean()
+        jump_volatility = jumps.std()
+        jump_skewness = stats.skew(jumps)
+        jump_kurtosis = stats.kurtosis(jumps)
+    else:
+        mean_jump_size = 0
+        jump_volatility = 0.01  # Small default value
+        jump_skewness = 0
+        jump_kurtosis = 0
+
+    # Diffusion parameters from non-jump returns (annualized)
+    mu_diffusion = non_jumps.mean() / dt
+    sigma_diffusion = non_jumps.std() / np.sqrt(dt)
+
+    # Overall parameters (including jumps)
+    mu_total = returns.mean() / dt
+    sigma_total = returns.std() / np.sqrt(dt)
+
+    # Jump contribution to total variance
+    jump_variance_contribution = (jump_volatility**2 + mean_jump_size**2) * jump_intensity
+    total_variance = sigma_total**2
+    jump_variance_ratio = jump_variance_contribution / total_variance if total_variance > 0 else 0
+
+    # Maximum likelihood estimation for jump parameters
+    def jump_diffusion_log_likelihood(params, returns, dt):
+        mu, sigma, lam, mu_j, sigma_j = params
+
+        if sigma <= 0 or lam < 0 or sigma_j <= 0:
+            return 1e10
+
+        total_log_likelihood = 0
+        for r in returns:
+            # Normal component (no jump)
+            normal_component = (1 - lam * dt) * stats.norm.pdf(r, (mu - 0.5*sigma**2)*dt, sigma*np.sqrt(dt))
+
+            # Jump component (at least one jump)
+            jump_component = lam * dt * stats.norm.pdf(r, (mu - 0.5*sigma**2)*dt + mu_j,
+                                                     np.sqrt(sigma**2 * dt + sigma_j**2))
+
+            total_log_likelihood += np.log(normal_component + jump_component + 1e-10)
+
+        return -total_log_likelihood  # Negative for minimization
+
+    # Initial guess for MLE
+    initial_guess = [mu_diffusion, sigma_diffusion, jump_intensity, mean_jump_size, jump_volatility]
+    bounds = [
+        (mu_diffusion*0.1, mu_diffusion*10),
+        (sigma_diffusion*0.1, sigma_diffusion*10),
+        (0, jump_intensity*10),
+        (mean_jump_size-1, mean_jump_size+1) if n_jumps > 0 else (-1, 1),
+        (0.001, jump_volatility*10) if n_jumps > 0 else (0.001, 1)
+    ]
+
+    try:
+        result = minimize(jump_diffusion_log_likelihood, initial_guess, args=(returns.values, dt),
+                         bounds=bounds, method='L-BFGS-B', options={'maxiter': 1000})
+        mu_mle, sigma_mle, lambda_mle, mu_jump_mle, sigma_jump_mle = result.x
+    except Exception as e:
+        print(f"MLE optimization failed: {e}")
+        mu_mle, sigma_mle, lambda_mle, mu_jump_mle, sigma_jump_mle = mu_diffusion, sigma_diffusion, jump_intensity, mean_jump_size, jump_volatility
+
+    jump_params = {
+        # Basic parameters
+        'mu_diffusion': mu_diffusion,
+        'sigma_diffusion': sigma_diffusion,
+        'jump_intensity': jump_intensity,
+        'mean_jump_size': mean_jump_size,
+        'jump_volatility': jump_volatility,
+
+        # MLE estimated parameters
+        'mu_mle': mu_mle,
+        'sigma_mle': sigma_mle,
+        'lambda_mle': lambda_mle,
+        'mu_jump_mle': mu_jump_mle,
+        'sigma_jump_mle': sigma_jump_mle,
+
+        # Jump statistics
+        'n_jumps': n_jumps,
+        'jump_frequency': n_jumps / n_obs,
+        'jump_skewness': jump_skewness,
+        'jump_kurtosis': jump_kurtosis,
+
+        # Variance decomposition
+        'jump_variance_contribution': jump_variance_contribution,
+        'total_variance': total_variance,
+        'jump_variance_ratio': jump_variance_ratio,
+
+        # Detection metrics
+        'jump_threshold_used': threshold,
+        'jump_detection_method': 'MAD'
+    }
+
+    return jump_params, jumps, non_jumps
+
+def print_parameter_summary(gbm_params, jump_params):
+    """
+    Print comprehensive parameter summary for both models.
+    """
+    print("\n" + "=" * 80)
+    print("COMPREHENSIVE PARAMETER ESTIMATION SUMMARY")
+    print("=" * 80)
+
+    print("\nGEOMETRIC BROWNIAN MOTION PARAMETERS:")
+    print("-" * 50)
+    print(f"Annual Drift Rate (μ): {gbm_params['mu_annual']:.6f}")
+    print(f"Annual Volatility (σ): {gbm_params['sigma_annual']:.6f}")
+    print(f"MLE Drift Rate: {gbm_params['mu_mle']:.6f}")
+    print(f"MLE Volatility: {gbm_params['sigma_mle']:.6f}")
+    print(f"Daily Drift: {gbm_params['mu_daily']:.6f}")
+    print(f"Daily Volatility: {gbm_params['sigma_daily']:.6f}")
+    print(f"Sharpe Ratio: {gbm_params['sharpe_ratio']:.6f}")
+    print(f"Initial Price: ${gbm_params['initial_price']:.2f}")
+    print(f"Total Return: {gbm_params['total_return']:.2%}")
+    print(f"Observations: {gbm_params['n_observations']}")
+
+    print("\nJUMP DIFFUSION MODEL PARAMETERS:")
+    print("-" * 50)
+    print(f"Diffusion Drift (μ_d): {jump_params['mu_diffusion']:.6f}")
+    print(f"Diffusion Volatility (σ_d): {jump_params['sigma_diffusion']:.6f}")
+    print(f"Jump Intensity (λ): {jump_params['jump_intensity']:.6f} jumps/year")
+    print(f"Mean Jump Size (μ_j): {jump_params['mean_jump_size']:.6f}")
+    print(f"Jump Volatility (σ_j): {jump_params['jump_volatility']:.6f}")
+
+    print(f"\nMLE Estimated Parameters:")
+    print(f"MLE Drift: {jump_params['mu_mle']:.6f}")
+    print(f"MLE Volatility: {jump_params['sigma_mle']:.6f}")
+    print(f"MLE Jump Intensity: {jump_params['lambda_mle']:.6f}")
+    print(f"MLE Mean Jump Size: {jump_params['mu_jump_mle']:.6f}")
+    print(f"MLE Jump Volatility: {jump_params['sigma_jump_mle']:.6f}")
+
+    print(f"\nJump Statistics:")
+    print(f"Number of Jumps Detected: {jump_params['n_jumps']}")
+    print(f"Jump Frequency: {jump_params['jump_frequency']:.4f}")
+    print(f"Jump Skewness: {jump_params['jump_skewness']:.4f}")
+    print(f"Jump Kurtosis: {jump_params['jump_kurtosis']:.4f}")
+    print(f"Jump Variance Contribution: {jump_params['jump_variance_ratio']:.2%}")
 
 # ==============================
-# SIMULATION FUNCTIONS
+# CORRECTED JUMP DIFFUSION IMPLEMENTATION
 # ==============================
 
-def simulate_jump_diffusion(log_returns, mu, sigma, init_price, t_final):
-    """Simulate jump-diffusion process with realistic Bitcoin parameters"""
+def detect_jumps_robust(returns, threshold=3):
+    """
+    Use robust statistics for jump detection in return series.
+    More reliable than standard deviation for fat-tailed distributions.
+
+    Parameters:
+    -----------
+    returns : pandas.Series
+        Asset returns series
+    threshold : float
+        Threshold for jump detection in MAD units
+
+    Returns:
+    --------
+    tuple
+        (jump_returns, jump_mask)
+    """
+    median_return = np.median(returns)
+    mad_return = mad(returns)
+    # Consistent estimator for normal distribution
+    z_scores = (returns - median_return) / (1.4826 * mad_return)
+    jump_mask = abs(z_scores) > threshold
+    return returns[jump_mask], jump_mask
+
+def simulate_merton_jump_diffusion(mu_diffusion, sigma_diffusion, lambda_jump,
+                                 mu_jump, sigma_jump, init_price, n_days, dt=1/365):
+    """
+    Correct Merton Jump Diffusion simulation with random jump sizes.
+
+    The Merton model formula:
+    dS_t/S_t = μ dt + σ dW_t + (e^J_t - 1) dN_t
+
+    Where:
+    - μ: diffusion drift
+    - σ: diffusion volatility
+    - dW_t: Brownian motion
+    - N_t: Poisson process with intensity λ
+    - J_t: random jump sizes ~ N(μ_j, σ_j²)
+
+    Parameters:
+    -----------
+    mu_diffusion : float
+        Annual drift rate (diffusion component)
+    sigma_diffusion : float
+        Annual volatility (diffusion component)
+    lambda_jump : float
+        Annual jump intensity (jumps per year)
+    mu_jump : float
+        Mean jump size (log return)
+    sigma_jump : float
+        Standard deviation of jump sizes
+    init_price : float
+        Initial price
+    n_days : int
+        Number of days to simulate
+    dt : float
+        Time step in years (default 1/365 for daily)
+
+    Returns:
+    --------
+    numpy.ndarray
+        Simulated price path
+    """
+    n_steps = n_days
+    prices = np.zeros(n_steps)
+    prices[0] = init_price
+
     # Convert annual parameters to daily
-    mu_daily = mu / 365  # Changed to 365 for Bitcoin
-    sigma_daily = sigma / np.sqrt(365)  # Changed to 365 for Bitcoin
+    mu_daily = mu_diffusion * dt
+    sigma_daily = sigma_diffusion * np.sqrt(dt)
+    lambda_daily = lambda_jump * dt
 
-    # Define the functions for the jump-diffusion model
-    a = lambda x: mu_daily
-    b = lambda x: sigma_daily
+    for t in range(1, n_steps):
+        # Standard Brownian motion (diffusion component)
+        Z = np.random.normal(0, 1)
 
-    # REALISTIC BITCOIN JUMP PARAMETERS
-    xi = 0.08  # 8% average jump size
-    lamb = 0.05  # 5% daily probability of a jump
+        # Diffusion component (adjusted for volatility drag)
+        diffusion_component = (mu_daily - 0.5 * sigma_daily**2) + sigma_daily * Z
 
-    # Simulation parameters
-    delta_t = 1
+        # Jump component
+        jump_component = 0
+        n_jumps = np.random.poisson(lambda_daily)
 
-    # Simulate the jump-diffusion process for log prices
-    simulated_log_prices = jd_process(
-        time=t_final,
-        delta_t=delta_t,
-        a=a,
-        b=b,
-        xi=xi,
-        lamb=lamb,
-        init=np.log(init_price)
-    )
+        if n_jumps > 0:
+            # Sum of random jump sizes (in log space)
+            jump_sizes = np.random.normal(mu_jump, sigma_jump, n_jumps)
+            jump_component = np.sum(jump_sizes)
 
-    # Convert back to prices
-    simulated_prices = np.exp(simulated_log_prices)
+        # Combined return (in log space)
+        total_log_return = diffusion_component + jump_component
 
-    return simulated_prices
+        # Update price
+        prices[t] = prices[t-1] * np.exp(total_log_return)
 
+    return prices
+
+# ==============================
+# GEOMETRIC BROWNIAN MOTION SIMULATION
+# ==============================
 
 def simulate_geometric_brownian_motion(mu, sigma, init_price, n_days):
-    """Simulate Geometric Brownian Motion process"""
-    dt = 1 / 365  # Daily time step in years (changed to 365 for Bitcoin)
+    """
+    Simulate price path using Geometric Brownian Motion model.
+    Standard model for stock price evolution in continuous time.
+
+    Parameters:
+    -----------
+    mu : float
+        Annual drift rate
+    sigma : float
+        Annual volatility
+    init_price : float
+        Initial price for simulation
+    n_days : int
+        Number of days to simulate
+
+    Returns:
+    --------
+    numpy.ndarray
+        Simulated price path
+    """
+    dt = 1 / 365  # Daily time step in years
     prices = np.zeros(n_days)
     prices[0] = init_price
 
@@ -261,27 +629,40 @@ def simulate_geometric_brownian_motion(mu, sigma, init_price, n_days):
 
     return prices
 
-
 # ==============================
-# PERFORMANCE EVALUATION FUNCTIONS
+# MODEL EVALUATION AND COMPARISON FUNCTIONS
 # ==============================
 
 def calculate_performance_metrics(actual_prices, simulated_prices, model_name):
-    """Calculate performance metrics for model evaluation"""
+    """
+    Calculate comprehensive performance metrics for model evaluation.
+    Includes price accuracy, returns, and statistical measures.
+
+    Parameters:
+    -----------
+    actual_prices : pandas.Series
+        Historical actual prices
+    simulated_prices : numpy.ndarray
+        Model-simulated prices
+    model_name : str
+        Name of the model for labeling
+
+    Returns:
+    --------
+    dict
+        Dictionary of performance metrics
+    """
     actual_final = actual_prices.iloc[-1]
     simulated_final = simulated_prices[-1]
 
+    # Calculate total returns
     actual_return = (actual_prices.iloc[-1] / actual_prices.iloc[0] - 1) * 100
     simulated_return = (simulated_prices[-1] / simulated_prices[0] - 1) * 100
 
-    # Calculate RMSE (Root Mean Square Error)
-    rmse = np.sqrt(np.mean((actual_prices.values - simulated_prices) ** 2))
-
-    # Calculate MAE (Mean Absolute Error)
-    mae = np.mean(np.abs(actual_prices.values - simulated_prices))
-
-    # Calculate correlation
-    correlation = np.corrcoef(actual_prices.values, simulated_prices)[0, 1]
+    # Calculate error metrics
+    rmse = np.sqrt(np.mean((actual_prices.values - simulated_prices) ** 2))  # Root Mean Square Error
+    mae = np.mean(np.abs(actual_prices.values - simulated_prices))  # Mean Absolute Error
+    correlation = np.corrcoef(actual_prices.values, simulated_prices)[0, 1]  # Correlation coefficient
 
     metrics = {
         'Model': model_name,
@@ -298,9 +679,22 @@ def calculate_performance_metrics(actual_prices, simulated_prices, model_name):
 
     return metrics
 
-
 def create_performance_table(jd_metrics, gbm_metrics):
-    """Create a formatted performance comparison table"""
+    """
+    Create formatted performance comparison table between models.
+
+    Parameters:
+    -----------
+    jd_metrics : dict
+        Jump-Diffusion model metrics
+    gbm_metrics : dict
+        GBM model metrics
+
+    Returns:
+    --------
+    pandas.DataFrame
+        Formatted comparison table
+    """
     metrics_df = pd.DataFrame([jd_metrics, gbm_metrics])
 
     # Display the table
@@ -311,13 +705,216 @@ def create_performance_table(jd_metrics, gbm_metrics):
 
     return metrics_df
 
+# ==============================
+# STATISTICAL MODELING FUNCTIONS
+# ==============================
+
+def calculate_gbm_loglikelihood(returns, mu, sigma):
+    """
+    Calculate log-likelihood for Geometric Brownian Motion model.
+
+    Parameters:
+    -----------
+    returns : pandas.Series
+        Asset returns
+    mu : float
+        Daily drift rate
+    sigma : float
+        Daily volatility
+
+    Returns:
+    --------
+    float
+        Log-likelihood value
+    """
+    n = len(returns)
+    log_likelihood = -n / 2 * np.log(2 * np.pi * sigma ** 2) - np.sum((returns - mu) ** 2) / (2 * sigma ** 2)
+    return log_likelihood
+
+def calculate_merton_loglikelihood(returns, mu, sigma, lambda_jump, alpha_jump, delta_jump, dt=1/365):
+    """
+    Calculate approximate log-likelihood for Merton jump-diffusion model.
+    Uses mixture of normal and jump components.
+
+    Parameters:
+    -----------
+    returns : pandas.Series
+        Asset returns
+    mu : float
+        Daily drift rate
+    sigma : float
+        Daily volatility
+    lambda_jump : float
+        Jump intensity
+    alpha_jump : float
+        Mean jump size
+    delta_jump : float
+        Jump volatility
+    dt : float
+        Time step
+
+    Returns:
+    --------
+    float
+        Log-likelihood value
+    """
+    n = len(returns)
+    total_loglikelihood = 0
+
+    for r in returns:
+        # Mixture of normal and jump components
+        normal_component = (1 - lambda_jump * dt) * stats.norm.pdf(r, mu * dt, sigma * np.sqrt(dt))
+        jump_component = lambda_jump * dt * stats.norm.pdf(r, mu * dt + alpha_jump,
+                                                           np.sqrt(sigma ** 2 * dt + delta_jump ** 2))
+        total_loglikelihood += np.log(normal_component + jump_component + 1e-10)  # Avoid log(0)
+
+    return total_loglikelihood
+
+class ModelComparator:
+    """
+    Comprehensive model comparison class using information criteria.
+    Compares models using AIC, BIC, and log-likelihood.
+    """
+
+    def __init__(self):
+        self.models = {}
+        self.results = pd.DataFrame(columns=['Model', 'LogLikelihood', 'AIC', 'BIC', 'Parameters'])
+
+    def add_model(self, name, loglikelihood, n_params, model_obj=None):
+        """
+        Add model to comparison framework.
+
+        Parameters:
+        -----------
+        name : str
+            Model name
+        loglikelihood : float
+            Log-likelihood value
+        n_params : int
+            Number of parameters
+        model_obj : object, optional
+            Model object for reference
+        """
+        # Calculate information criteria
+        aic = 2 * n_params - 2 * loglikelihood
+        bic = n_params * np.log(n_params) - 2 * loglikelihood
+
+        self.models[name] = {
+            'loglikelihood': loglikelihood,
+            'aic': aic,
+            'bic': bic,
+            'parameters': n_params,
+            'object': model_obj
+        }
+
+        new_row = pd.DataFrame({
+            'Model': [name],
+            'LogLikelihood': [loglikelihood],
+            'AIC': [aic],
+            'BIC': [bic],
+            'Parameters': [n_params]
+        })
+        self.results = pd.concat([self.results, new_row], ignore_index=True)
+
+    def print_comparison(self):
+        """
+        Print comprehensive model comparison results.
+        Includes ranking and AIC weights (model probabilities).
+        """
+        print("\n" + "=" * 80)
+        print("MODEL COMPARISON RESULTS")
+        print("=" * 80)
+
+        # Sort by AIC (lower is better)
+        self.results = self.results.sort_values('AIC')
+        self.results['AIC_Rank'] = range(1, len(self.results) + 1)
+        self.results['BIC_Rank'] = self.results['BIC'].rank()
+        self.results['LogLikelihood_Rank'] = self.results['LogLikelihood'].rank(ascending=False)
+
+        print(self.results.to_string(index=False, float_format='%.2f'))
+
+        # Identify best model
+        best_model = self.results.iloc[0]
+        print(f"\nBEST MODEL: {best_model['Model']} (AIC: {best_model['AIC']:.2f})")
+
+        # Calculate AIC weights (model probabilities)
+        aic_min = self.results['AIC'].min()
+        delta_aic = self.results['AIC'] - aic_min
+        aic_weights = np.exp(-0.5 * delta_aic) / np.sum(np.exp(-0.5 * delta_aic))
+
+        print("\nAIC Weights (Model Probabilities):")
+        for i, (model, weight) in enumerate(zip(self.results['Model'], aic_weights)):
+            print(f"  {model}: {weight:.3f}")
 
 # ==============================
-# MAIN SIMULATION FUNCTION
+# ENHANCED MAIN SIMULATION AND ANALYSIS FUNCTIONS
 # ==============================
 
-def main_second_code():
-    """Main function for the second code - runs first"""
+def create_parameter_comparison_plot(gbm_params, jump_params, returns, jumps, non_jumps):
+    """
+    Create comprehensive visualization comparing parameters and distributions.
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+
+    # Plot 1: Return distributions comparison
+    axes[0,0].hist(non_jumps, bins=50, alpha=0.7, label='Non-Jump Returns', density=True)
+    axes[0,0].hist(jumps, bins=20, alpha=0.7, label='Jump Returns', density=True, color='red')
+    x = np.linspace(returns.min(), returns.max(), 100)
+    axes[0,0].plot(x, stats.norm.pdf(x, returns.mean(), returns.std()),
+                   'k--', label='Normal Distribution', linewidth=2)
+    axes[0,0].set_title('Return Distributions: Jump vs Non-Jump')
+    axes[0,0].set_xlabel('Daily Returns')
+    axes[0,0].set_ylabel('Density')
+    axes[0,0].legend()
+    axes[0,0].grid(True, alpha=0.3)
+
+    # Plot 2: Parameter comparison
+    parameters = ['Drift (μ)', 'Volatility (σ)']
+    gbm_values = [gbm_params['mu_mle'], gbm_params['sigma_mle']]
+    jd_values = [jump_params['mu_mle'], jump_params['sigma_mle']]
+
+    x_pos = np.arange(len(parameters))
+    width = 0.35
+
+    axes[0,1].bar(x_pos - width/2, gbm_values, width, label='GBM', alpha=0.8)
+    axes[0,1].bar(x_pos + width/2, jd_values, width, label='Jump Diffusion', alpha=0.8)
+    axes[0,1].set_title('Parameter Comparison: GBM vs Jump Diffusion')
+    axes[0,1].set_ylabel('Parameter Value')
+    axes[0,1].set_xticks(x_pos)
+    axes[0,1].set_xticklabels(parameters)
+    axes[0,1].legend()
+    axes[0,1].grid(True, alpha=0.3)
+
+    # Plot 3: Jump parameters
+    jump_params_names = ['Jump Intensity\n(λ)', 'Mean Jump\nSize (μ_j)', 'Jump Volatility\n(σ_j)']
+    jump_params_values = [jump_params['lambda_mle'], jump_params['mu_jump_mle'], jump_params['sigma_jump_mle']]
+
+    axes[1,0].bar(jump_params_names, jump_params_values, alpha=0.7, color='orange')
+    axes[1,0].set_title('Jump Diffusion: Jump Parameters')
+    axes[1,0].set_ylabel('Parameter Value')
+    axes[1,0].grid(True, alpha=0.3)
+
+    # Plot 4: Jump statistics
+    stats_names = ['Total\nReturns', 'Jumps\nDetected', 'Jump\nFrequency', 'Variance\nfrom Jumps']
+    stats_values = [len(returns), jump_params['n_jumps'],
+                   jump_params['jump_frequency'], jump_params['jump_variance_ratio']]
+
+    axes[1,1].bar(stats_names, stats_values, alpha=0.7, color='green')
+    axes[1,1].set_title('Jump Statistics Summary')
+    axes[1,1].set_ylabel('Value')
+    axes[1,1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('parameter_comparison.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+def main_bitcoin_simulation_enhanced():
+    """
+    Enhanced main function with comprehensive parameter estimation.
+    """
+    print("ENHANCED BITCOIN SIMULATION WITH COMPREHENSIVE PARAMETER ESTIMATION")
+    print("=" * 80)
+
     # 1. Retrieve historical Bitcoin data
     start_date = "2015-01-01"
     end_date = "2024-05-01"
@@ -327,62 +924,74 @@ def main_second_code():
 
     if data is None or data.empty:
         print("Could not download data. Exiting.")
-        return
+        return None
 
     print("Data downloaded successfully!")
     print(f"Date range: {data.index[0].strftime('%Y-%m-%d')} to {data.index[-1].strftime('%Y-%m-%d')}")
 
-    # Extract price data
+    # Extract and validate price data
     prices = get_price_data(data)
     print(f"Initial price: ${prices.iloc[0]:.2f}")
     print(f"Final price: ${prices.iloc[-1]:.2f}")
+    print(f"Total periods: {len(prices)}")
 
-    # 2. Parameter estimation from historical data
-    print("\nEstimating parameters from historical data...")
-    log_returns, mu, sigma, init_price = estimate_parameters(prices)
+    # 2. Comprehensive parameter estimation
+    print("\n" + "=" * 80)
+    print("COMPREHENSIVE PARAMETER ESTIMATION")
+    print("=" * 80)
 
-    # 3. Simulations
-    print("\nRunning simulations...")
+    # GBM parameter estimation
+    print("\nEstimating GBM parameters...")
+    gbm_params, log_returns = estimate_gbm_parameters(prices)
+
+    # Jump Diffusion parameter estimation
+    print("Estimating Jump Diffusion parameters...")
+    jump_params, jumps, non_jumps = estimate_jump_diffusion_parameters(log_returns)
+
+    # Print comprehensive parameter summary
+    print_parameter_summary(gbm_params, jump_params)
+
+    # 3. Run stochastic process simulations with estimated parameters
+    print("\n" + "=" * 80)
+    print("RUNNING SIMULATIONS WITH ESTIMATED PARAMETERS")
+    print("=" * 80)
+
     t_final = len(log_returns)
+    init_price = prices.iloc[0]
 
-    # Jump-diffusion simulation
-    jd_prices = simulate_jump_diffusion(log_returns, mu, sigma, init_price, t_final)
+    # Use MLE parameters for simulations
+    # Jump Diffusion simulation
+    jd_prices = simulate_merton_jump_diffusion(
+        mu_diffusion=jump_params['mu_mle'],
+        sigma_diffusion=jump_params['sigma_mle'],
+        lambda_jump=jump_params['lambda_mle'],
+        mu_jump=jump_params['mu_jump_mle'],
+        sigma_jump=jump_params['sigma_jump_mle'],
+        init_price=init_price,
+        n_days=t_final
+    )
 
     # Geometric Brownian Motion simulation
-    gbm_prices = simulate_geometric_brownian_motion(mu, sigma, init_price, t_final)
+    gbm_prices = simulate_geometric_brownian_motion(
+        gbm_params['mu_mle'],
+        gbm_params['sigma_mle'],
+        init_price,
+        t_final
+    )
 
-    # Fix alignment - use same number of points
+    # 4. Align data for comparison
     historical_prices_aligned = prices.iloc[1:]
     historical_dates_aligned = data.index[1:]
 
-    # 4. Calculate performance metrics
-    print("\n" + "=" * 80)
-    print("PARAMETERS USED AND OBTAINED")
-    print("=" * 80)
-
+    # 5. Calculate performance metrics
     jd_metrics = calculate_performance_metrics(historical_prices_aligned, jd_prices, "Jump-Diffusion")
     gbm_metrics = calculate_performance_metrics(historical_prices_aligned, gbm_prices, "Geometric Brownian Motion")
 
-    # Display only parameters
-    print(f"\nINPUT PARAMETERS:")
-    print(f"• Annual drift (mu): {mu:.6f}")
-    print(f"• Annual volatility (sigma): {sigma:.6f}")
-    print(f"• Jump size (xi): 0.08")
-    print(f"• Jump probability (lambda): 0.05")
-    print(f"• Initial price: ${init_price:.2f}")
-    print(f"• Time period: {t_final} days")
-
-    print(f"\nOUTPUT PARAMETERS:")
-    print(f"• Jump-Diffusion final price: {jd_metrics['Simulated Final Price']}")
-    print(f"• GBM final price: {gbm_metrics['Simulated Final Price']}")
-    print(f"• Jump-Diffusion correlation: {jd_metrics['Correlation']}")
-    print(f"• GBM correlation: {gbm_metrics['Correlation']}")
-
-    # Create and display performance table
+    # Create and display performance comparison table
     metrics_df = create_performance_table(jd_metrics, gbm_metrics)
 
-    # 5. Single comprehensive visualization
-    plt.figure(figsize=(16, 10))
+    # 6. Create enhanced visualization with parameter annotations
+    plt.figure(figsize=(16, 12))
 
     # Plot historical data
     plt.plot(historical_dates_aligned, historical_prices_aligned.values,
@@ -407,652 +1016,570 @@ def main_second_code():
              color='#2ca02c',
              alpha=0.8)
 
-    plt.title("Figure 4.1: Bitcoin Price Simulation: Historical vs Model (GBM & JDM)",
+    plt.title("Enhanced Bitcoin Price Simulation: Historical vs Model (GBM & JDM)\nwith Comprehensive Parameter Estimation",
               fontsize=16, fontweight='bold', pad=20)
     plt.xlabel("Date", fontsize=12)
     plt.ylabel("Price (USD)", fontsize=12)
     plt.legend(fontsize=12, loc='upper left')
     plt.grid(True, alpha=0.3)
 
+    # Add parameter annotations
+    param_text = (
+        f"GBM Parameters:\n"
+        f"μ = {gbm_params['mu_mle']:.4f}, σ = {gbm_params['sigma_mle']:.4f}\n\n"
+        f"Jump Diffusion Parameters:\n"
+        f"μ_d = {jump_params['mu_mle']:.4f}, σ_d = {jump_params['sigma_mle']:.4f}\n"
+        f"λ = {jump_params['lambda_mle']:.4f}, μ_j = {jump_params['mu_jump_mle']:.4f}\n"
+        f"σ_j = {jump_params['sigma_jump_mle']:.4f}\n"
+        f"Jumps detected: {jump_params['n_jumps']}"
+    )
+
+    plt.annotate(param_text, xy=(0.02, 0.98), xycoords='axes fraction',
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+                fontsize=10, verticalalignment='top')
+
     # Use logarithmic scale for better visualization
     plt.yscale('log')
 
     plt.tight_layout()
-    plt.savefig('figure4_1.png', dpi=300, bbox_inches='tight')
+    plt.savefig('enhanced_bitcoin_simulation.png', dpi=300, bbox_inches='tight')
     plt.show()
 
-    return metrics_df
-
-
-# ==============================
-# EXECUTE SECOND CODE (SIMULATION MODELS)
-# ==============================
-
-print("EXECUTING SECOND CODE - BITCOIN SIMULATION MODELS")
-print("=" * 80)
-metrics_results = main_second_code()
-
-# ==============================
-# FIRST CODE - COMPREHENSIVE ANALYSIS
-# ==============================
-
-print("\n\n" + "=" * 80)
-print("EXECUTING FIRST CODE - COMPREHENSIVE ANALYSIS")
-print("=" * 80)
-
-# Import additional libraries for comprehensive analysis
-import pandas_datareader.data as web
-from pandas_datareader.fred import FredReader
-import datetime
-import seaborn as sns
-from statsmodels.tsa.arima.model import ARIMA
-from arch import arch_model
-from arch.univariate import EGARCH, GARCH
-import scipy.stats as stats
-from statsmodels.tsa.stattools import adfuller, coint
-from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-from statsmodels.tsa.vector_ar.vecm import VECM
-from scipy.stats import pearsonr, ttest_ind
-from statsmodels.robust import mad
-
-# ==============================
-# FRED API key configuration
-# ==============================
-FRED_API_KEY = "f04f41b6498c862d900d20056c95539a"
-
-# ==============================
-# Visualization style configuration
-# ==============================
-plt.style.use('seaborn-v0_8')
-sns.set_palette("deep")
-
-
-# ==============================
-# ENHANCED JUMP DETECTION FUNCTION
-# ==============================
-
-def detect_jumps_robust(returns, threshold=3):
-    """Use robust statistics for jump detection"""
-    median_return = np.median(returns)
-    mad_return = mad(returns)
-    z_scores = (returns - median_return) / (1.4826 * mad_return)  # Consistent estimator for normal distribution
-    jump_mask = abs(z_scores) > threshold
-    return returns[jump_mask], jump_mask
-
-
-def calculate_gbm_loglikelihood(returns, mu, sigma):
-    """Calculate log-likelihood for GBM model"""
-    n = len(returns)
-    log_likelihood = -n / 2 * np.log(2 * np.pi * sigma ** 2) - np.sum((returns - mu) ** 2) / (2 * sigma ** 2)
-    return log_likelihood
-
-
-def calculate_merton_loglikelihood(returns, mu, sigma, lambda_jump, alpha_jump, delta_jump,
-                                   dt=1 / 365):  # Changed to 365
-    """Calculate approximate log-likelihood for Merton model"""
-    n = len(returns)
-    total_loglikelihood = 0
-
-    for r in returns:
-        # Simple approximation: mixture of normal and jump components
-        normal_component = (1 - lambda_jump * dt) * stats.norm.pdf(r, mu * dt, sigma * np.sqrt(dt))
-        jump_component = lambda_jump * dt * stats.norm.pdf(r, mu * dt + alpha_jump,
-                                                           np.sqrt(sigma ** 2 * dt + delta_jump ** 2))
-        total_loglikelihood += np.log(normal_component + jump_component + 1e-10)  # Avoid log(0)
-
-    return total_loglikelihood
-
-
-# ==============================
-# MODEL COMPARISON CLASS
-# ==============================
-
-class ModelComparator:
-    def __init__(self):
-        self.models = {}
-        self.results = pd.DataFrame(columns=['Model', 'LogLikelihood', 'AIC', 'BIC', 'Parameters'])
-
-    def add_model(self, name, loglikelihood, n_params, model_obj=None):
-        """Add model to comparison"""
-        aic = 2 * n_params - 2 * loglikelihood
-        bic = n_params * np.log(n_params) - 2 * loglikelihood
-
-        self.models[name] = {
-            'loglikelihood': loglikelihood,
-            'aic': aic,
-            'bic': bic,
-            'parameters': n_params,
-            'object': model_obj
-        }
-
-        new_row = pd.DataFrame({
-            'Model': [name],
-            'LogLikelihood': [loglikelihood],
-            'AIC': [aic],
-            'BIC': [bic],
-            'Parameters': [n_params]
-        })
-        self.results = pd.concat([self.results, new_row], ignore_index=True)
-
-    def print_comparison(self):
-        """Print model comparison results"""
-        print("\n" + "=" * 80)
-        print("MODEL COMPARISON RESULTS")
-        print("=" * 80)
-
-        # Sort by AIC (lower is better)
-        self.results = self.results.sort_values('AIC')
-        self.results['AIC_Rank'] = range(1, len(self.results) + 1)
-        self.results['BIC_Rank'] = self.results['BIC'].rank()
-        self.results['LogLikelihood_Rank'] = self.results['LogLikelihood'].rank(ascending=False)
-
-        print(self.results.to_string(index=False, float_format='%.2f'))
-
-        # Best model
-        best_model = self.results.iloc[0]
-        print(f"\nBEST MODEL: {best_model['Model']} (AIC: {best_model['AIC']:.2f})")
-
-        # Calculate AIC weights (model probabilities)
-        aic_min = self.results['AIC'].min()
-        delta_aic = self.results['AIC'] - aic_min
-        aic_weights = np.exp(-0.5 * delta_aic) / np.sum(np.exp(-0.5 * delta_aic))
-
-        print("\nAIC Weights (Model Probabilities):")
-        for i, (model, weight) in enumerate(zip(self.results['Model'], aic_weights)):
-            print(f"  {model}: {weight:.3f}")
-
-
-# ==============================
-# DATA COLLECTION AND PREPROCESSING
-# ==============================
-
-# Date range for data collection
-start_date = datetime.datetime(2015, 1, 1)
-end_date = datetime.datetime(2024, 6, 30)
-
-# Fetch Bitcoin data from Yahoo Finance
-print("Fetching Bitcoin data...")
-btc = yf.download('BTC-USD', start=start_date, end=end_date, progress=False)
-
-if 'Adj Close' in btc.columns:
-    btc_prices = btc['Adj Close']
-elif 'Close' in btc.columns:
-    btc_prices = btc['Close']
-else:
-    btc_prices = btc.iloc[:, 0]
-
-if isinstance(btc_prices, pd.DataFrame):
-    btc_prices = btc_prices.iloc[:, 0]
-
-btc_returns = np.log(btc_prices / btc_prices.shift(1)).dropna()
-
-# Fetch Gold data
-print("Fetching Gold data...")
-gold = yf.download('GC=F', start=start_date, end=end_date, progress=False)
-
-if 'Adj Close' in gold.columns:
-    gold_prices = gold['Adj Close']
-elif 'Close' in gold.columns:
-    gold_prices = gold['Close']
-else:
-    gold_prices = gold.iloc[:, 0]
-
-if isinstance(gold_prices, pd.DataFrame):
-    gold_prices = gold_prices.iloc[:, 0]
-
-gold_returns = np.log(gold_prices / gold_prices.shift(1)).dropna()
-
-# ==============================
-# ADDITIONAL MACROECONOMIC DATA COLLECTION
-# ==============================
-
-print("Fetching additional macroeconomic data...")
-
-# S&P 500
-sp500 = yf.download('^GSPC', start=start_date, end=end_date, progress=False)
-sp500_prices = sp500['Adj Close'] if 'Adj Close' in sp500.columns else sp500['Close']
-if isinstance(sp500_prices, pd.DataFrame):
-    sp500_prices = sp500_prices.iloc[:, 0]
-sp500_returns = np.log(sp500_prices / sp500_prices.shift(1)).dropna()
-
-# US Dollar Index
-dxy = yf.download('DX-Y.NYB', start=start_date, end=end_date, progress=False)
-dxy_prices = dxy['Adj Close'] if 'Adj Close' in dxy.columns else dxy['Close']
-if isinstance(dxy_prices, pd.DataFrame):
-    dxy_prices = dxy_prices.iloc[:, 0]
-dxy_returns = np.log(dxy_prices / dxy_prices.shift(1)).dropna()
-
-# Oil prices (WTI)
-wti = yf.download('CL=F', start=start_date, end=end_date, progress=False)
-wti_prices = wti['Adj Close'] if 'Adj Close' in wti.columns else wti['Close']
-if isinstance(wti_prices, pd.DataFrame):
-    wti_prices = wti_prices.iloc[:, 0]
-wti_returns = np.log(wti_prices / wti_prices.shift(1)).dropna()
-
-# ==============================
-# CPI DATA - USING ACCURATE DATA FROM INTRODUCTORY CHARTS
-# ==============================
-
-print("Using accurate CPI data from introductory charts...")
-
-# Convert monthly CPI data to daily frequency using interpolation
-daily_dates = pd.date_range(start=start_date, end=end_date, freq='D')
-cpi_daily = cpi_data['CPIAUCSL'].reindex(daily_dates).interpolate(method='time')
-cpi_daily = cpi_daily.reindex(btc_returns.index).ffill().bfill()
-
-if isinstance(cpi_daily, pd.DataFrame):
-    cpi_daily = cpi_daily.iloc[:, 0]
-
-# ==============================
-# DATA ALIGNMENT
-# ==============================
-
-all_data = pd.DataFrame({
-    'BTC': btc_returns,
-    'GOLD': gold_returns,
-    'SP500': sp500_returns,
-    'DXY': dxy_returns,
-    'WTI': wti_returns,
-    'CPI': cpi_daily
-}).dropna()
-
-btc_returns = all_data['BTC']
-gold_returns = all_data['GOLD']
-sp500_returns = all_data['SP500']
-dxy_returns = all_data['DXY']
-wti_returns = all_data['WTI']
-cpi_daily = all_data['CPI']
-
-# ==============================
-# ENHANCED JUMP DETECTION ANALYSIS
-# ==============================
-
-print("\n" + "=" * 50)
-print("ENHANCED JUMP DETECTION ANALYSIS")
-print("=" * 50)
-
-# Traditional method (standard deviation)
-std_return = float(np.std(btc_returns))
-threshold_std = 3 * std_return
-jumps_std = btc_returns[btc_returns.abs() > threshold_std]
-
-# Robust method (MAD)
-jumps_robust, jump_mask_robust = detect_jumps_robust(btc_returns, threshold=3)
-
-print(f"Traditional method (3σ): {len(jumps_std)} jumps detected")
-print(f"Robust method (3*MAD): {len(jumps_robust)} jumps detected")
-print(f"Overlap between methods: {len(set(jumps_std.index) & set(jumps_robust.index))}")
-
-# Use robust method for better jump detection
-jump_returns = jumps_robust
-non_jump_returns = btc_returns[~jump_mask_robust]
-
-# ==============================
-# DESCRIPTIVE STATISTICS
-# ==============================
-
-mean_return = float(np.mean(btc_returns))
-skewness = float(stats.skew(btc_returns))
-kurtosis = float(stats.kurtosis(btc_returns))
-adf_result = adfuller(btc_returns)
-adf_pvalue = adf_result[1]
-
-num_large_jumps = len(jump_returns)
-avg_jump_size = float(np.mean(jump_returns)) if num_large_jumps > 0 else 0
-
-print("\nDescriptive Statistics for Bitcoin Returns:")
-print(f"Mean Daily Return: {mean_return:.6f}")
-print(f"Std Daily Return: {std_return:.6f}")
-print(f"Number of Large Jumps: {num_large_jumps}")
-print(f"Average Jump Size: {avg_jump_size:.6f}")
-print(f"ADF p-value: {adf_pvalue:.6f}")
-print(f"Skewness: {skewness:.3f}")
-print(f"Kurtosis: {kurtosis:.3f}")
-
-# ==============================
-# GBM PARAMETERS ESTIMATION
-# ==============================
-
-mu_gbm = float(np.mean(btc_returns)) * 365  # Changed to 365
-sigma_gbm = float(np.std(btc_returns)) * np.sqrt(365)  # Changed to 365
-
-print(f"\nGBM Parameters:")
-print(f"Drift (μ): {mu_gbm:.6f}")
-print(f"Volatility (σ): {sigma_gbm:.6f}")
-
-# ==============================
-# MERTON JUMP-DIFFUSION PARAMETERS ESTIMATION
-# ==============================
-
-lambda_jump = len(jump_returns) / len(btc_returns)
-alpha_jump = float(np.mean(jump_returns))
-delta_jump = float(np.std(jump_returns))
-mu_diffusion = float(np.mean(non_jump_returns)) * 365  # Changed to 365
-sigma_diffusion = float(np.std(non_jump_returns)) * np.sqrt(365)  # Changed to 365
-
-print(f"\nMerton Jump-Diffusion Parameters:")
-print(f"Drift (μ): {mu_diffusion:.6f}")
-print(f"Volatility (σ): {sigma_diffusion:.6f}")
-print(f"Jump Intensity (λ): {lambda_jump:.6f} (per day)")
-print(f"Mean Jump Size (α): {alpha_jump:.6f}")
-print(f"Jump Volatility (δ): {delta_jump:.6f}")
-
-# ==============================
-# ARIMA + EGARCH MODEL FITTING
-# ==============================
-
-print("\nFitting ARIMA-EGARCH model...")
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-plot_acf(btc_returns, lags=30, ax=ax1)
-plot_pacf(btc_returns, lags=30, ax=ax2)
-plt.savefig('acf_pacf.png', dpi=300, bbox_inches='tight')
-plt.show()
-plt.close()
-
-model = ARIMA(btc_returns, order=(1, 0, 1))
-fit_arima = model.fit()
-residuals = fit_arima.resid.dropna()
-
-egarch = arch_model(residuals, vol='EGARCH', p=1, q=1, o=1)
-fit_egarch = egarch.fit(disp='off')
-print("EGARCH Model Results:")
-print(fit_egarch.summary())
-
-gjrgarch = arch_model(residuals, vol='GARCH', p=1, q=1, o=1)
-fit_gjrgarch = gjrgarch.fit(disp='off')
-print("\nGJR-GARCH Model Results:")
-print(fit_gjrgarch.summary())
-
-# ==============================
-# MODEL COMPARISON AND SELECTION
-# ==============================
-
-comparator = ModelComparator()
-
-# GBM Model
-gbm_loglikelihood = calculate_gbm_loglikelihood(btc_returns, mu_gbm / 365, sigma_gbm / np.sqrt(365))  # Changed to 365
-comparator.add_model('GBM', gbm_loglikelihood, n_params=2)
-
-# Merton Model
-merton_loglikelihood = calculate_merton_loglikelihood(
-    btc_returns,
-    mu_diffusion / 365,  # Changed to 365
-    sigma_diffusion / np.sqrt(365),  # Changed to 365
-    lambda_jump,
-    alpha_jump,
-    delta_jump
-)
-comparator.add_model('Merton_Jump_Diffusion', merton_loglikelihood, n_params=5)
-
-# ARIMA-EGARCH Model
-comparator.add_model('ARIMA-EGARCH', fit_egarch.loglikelihood, n_params=fit_egarch.num_params, model_obj=fit_egarch)
-
-# ARIMA-GJR-GARCH Model
-comparator.add_model('ARIMA-GJR-GARCH', fit_gjrgarch.loglikelihood, n_params=fit_gjrgarch.num_params,
-                     model_obj=fit_gjrgarch)
-
-# Print comprehensive model comparison
-comparator.print_comparison()
-
-# ==============================
-# CORRELATION ANALYSIS WITH STATISTICAL SIGNIFICANCE
-# ==============================
-
-print("\n" + "=" * 50)
-print("CORRELATION ANALYSIS WITH STATISTICAL SIGNIFICANCE")
-print("=" * 50)
-
-# Calculate correlations with p-values
-corr_btc_infl, pval_btc_infl = pearsonr(btc_returns, cpi_daily)
-corr_gold_infl, pval_gold_infl = pearsonr(gold_returns, cpi_daily)
-corr_btc_gold, pval_btc_gold = pearsonr(btc_returns, gold_returns)
-corr_btc_sp500, pval_btc_sp500 = pearsonr(btc_returns, sp500_returns)
-corr_gold_sp500, pval_gold_sp500 = pearsonr(gold_returns, sp500_returns)
-
-print("Correlation Analysis (with p-values):")
-print(
-    f"BTC-Inflation: {corr_btc_infl:.6f} (p-value: {pval_btc_infl:.4f}) {'**' if pval_btc_infl < 0.05 else 'not significant'}")
-print(
-    f"Gold-Inflation: {corr_gold_infl:.6f} (p-value: {pval_gold_infl:.4f}) {'**' if pval_gold_infl < 0.05 else 'not significant'}")
-print(
-    f"BTC-Gold: {corr_btc_gold:.6f} (p-value: {pval_btc_gold:.4f}) {'**' if pval_btc_gold < 0.05 else 'not significant'}")
-print(
-    f"BTC-S&P500: {corr_btc_sp500:.6f} (p-value: {pval_btc_sp500:.4f}) {'**' if pval_btc_sp500 < 0.05 else 'not significant'}")
-print(
-    f"Gold-S&P500: {corr_gold_sp500:.6f} (p-value: {pval_gold_sp500:.4f}) {'**' if pval_gold_sp500 < 0.05 else 'not significant'}")
-
-# ==============================
-# COINTEGRATION TESTS
-# ==============================
-
-print("\nCointegration Test (Bitcoin vs Gold):")
-coint_result = coint(btc_prices.reindex(gold_prices.index).dropna(),
-                     gold_prices.reindex(btc_prices.index).dropna())
-print(f"p-value: {coint_result[1]:.6f}")
-
-print("\nCointegration Test (Bitcoin vs Inflation):")
-cpi_aligned = cpi_daily.reindex(btc_prices.index).dropna()
-btc_aligned = btc_prices.reindex(cpi_aligned.index)
-coint_result2 = coint(btc_aligned, cpi_aligned)
-print(f"p-value: {coint_result2[1]:.6f}")
-
-# ==============================
-# DISTRIBUTION ANALYSIS VISUALIZATIONS
-# ==============================
-
-# Histogram vs Normal - NOW FIGURE 4.2
-plt.figure(figsize=(12, 6))
-plt.hist(btc_returns, bins=50, density=True, alpha=0.6, color='steelblue', label='Bitcoin Returns')
-x = np.linspace(float(btc_returns.min()), float(btc_returns.max()), 100)
-pdf = stats.norm.pdf(x, np.mean(btc_returns), np.std(btc_returns))
-plt.plot(x, pdf, 'k-', linewidth=2, label='Normal Distribution')
-plt.title('Figure 4.2: Histogram of Bitcoin Returns vs Normal Distribution', fontsize=14)
-plt.xlabel('Daily Returns')
-plt.ylabel('Density')
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.savefig('figure4_2.png', dpi=300, bbox_inches='tight')
-plt.show()
-plt.close()
-
-# Q-Q Plot - NOW FIGURE 4.3
-plt.figure(figsize=(10, 6))
-stats.probplot(btc_returns, dist="norm", plot=plt)
-plt.title('Figure 4.3: Q-Q Plot of Bitcoin Returns vs Normal Distribution', fontsize=14)
-plt.grid(True, alpha=0.3)
-plt.savefig('figure4_3.png', dpi=300, bbox_inches='tight')
-plt.show()
-plt.close()
-
-# ==============================
-# HEDGING EFFECTIVENESS ANALYSIS
-# ==============================
-
-cov_btc = np.cov(btc_returns, cpi_daily)[0, 1]
-var_pi = np.var(cpi_daily)
-hr_btc = cov_btc / var_pi
-
-cov_gold = np.cov(gold_returns, cpi_daily)[0, 1]
-hr_gold = cov_gold / var_pi
-
-eff_btc = 1 - np.var(btc_returns - hr_btc * cpi_daily) / np.var(btc_returns)
-eff_gold = 1 - np.var(gold_returns - hr_gold * cpi_daily) / np.var(gold_returns)
-
-print("\n" + "=" * 50)
-print("ENHANCED HEDGING EFFECTIVENESS ANALYSIS")
-print("=" * 50)
-print(f"Bitcoin Correlation with Inflation: {corr_btc_infl:.6f} (p-value: {pval_btc_infl:.4f})")
-print(f"Gold Correlation with Inflation: {corr_gold_infl:.6f} (p-value: {pval_gold_infl:.4f})")
-print(f"Bitcoin Hedge Ratio: {hr_btc:.6f}")
-print(f"Gold Hedge Ratio: {hr_gold:.6f}")
-print(f"Bitcoin Hedging Effectiveness: {eff_btc:.6f} ({eff_btc * 100:.4f}%)")
-print(f"Gold Hedging Effectiveness: {eff_gold:.6f} ({eff_gold * 100:.4f}%)")
-
-# Statistical test for hedging effectiveness difference
-hedged_btc = btc_returns - hr_btc * cpi_daily
-hedged_gold = gold_returns - hr_gold * cpi_daily
-
-t_stat, p_val = ttest_ind(hedged_btc, hedged_gold, equal_var=False)
-print(f"T-test for hedging effectiveness difference: t-stat={t_stat:.4f}, p-value={p_val:.4f}")
-
-# ==============================
-# CORRELATION HEATMAP VISUALIZATION
-# ==============================
-
-corr_data = pd.DataFrame({
-    'Bitcoin': btc_returns,
-    'Gold': gold_returns,
-    'S&P500': sp500_returns,
-    'USD Index': dxy_returns,
-    'Oil': wti_returns,
-    'Inflation': cpi_daily
-})
-corr_matrix = corr_data.corr()
-
-plt.figure(figsize=(12, 10))
-sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0,
-            square=True, fmt='.4f', cbar_kws={'label': 'Correlation Coefficient'})
-plt.title('Figure 4.4: Correlation Heatmap Between Assets and Macroeconomic Factors', fontsize=14)
-plt.savefig('figure4_4.png', dpi=300, bbox_inches='tight')
-plt.show()
-plt.close()
-
-# ==============================
-# ROLLING CORRELATIONS ANALYSIS
-# ==============================
-
-window_size = 365  # Changed to 365 for Bitcoin
-rolling_corr_btc_infl = btc_returns.rolling(window=window_size).corr(cpi_daily)
-rolling_corr_gold_infl = gold_returns.rolling(window=window_size).corr(cpi_daily)
-rolling_corr_btc_gold = btc_returns.rolling(window=window_size).corr(gold_returns)
-
-plt.figure(figsize=(14, 8))
-plt.plot(rolling_corr_btc_infl.index, rolling_corr_btc_infl.values, label='BTC-Inflation', linewidth=2)
-plt.plot(rolling_corr_gold_infl.index, rolling_corr_gold_infl.values, label='Gold-Inflation', linewidth=2)
-plt.plot(rolling_corr_btc_gold.index, rolling_corr_btc_gold.values, label='BTC-Gold', linewidth=2)
-plt.title('Figure 4.5: Rolling Correlations (1-Year Window)', fontsize=14)
-plt.xlabel('Date')
-plt.ylabel('Correlation')
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.savefig('figure4_5.png', dpi=300, bbox_inches='tight')
-plt.show()
-plt.close()
-
-# ==============================
-# SUBPERIOD ANALYSIS (PRE-COVID VS POST-COVID)
-# ==============================
-
-covid_cutoff = datetime.datetime(2020, 3, 1)
-
-pre_covid_mask = all_data.index < covid_cutoff
-pre_covid_btc = all_data['BTC'][pre_covid_mask]
-pre_covid_gold = all_data['GOLD'][pre_covid_mask]
-pre_covid_cpi = all_data['CPI'][pre_covid_mask]
-
-post_covid_mask = all_data.index >= covid_cutoff
-post_covid_btc = all_data['BTC'][post_covid_mask]
-post_covid_gold = all_data['GOLD'][post_covid_mask]
-post_covid_cpi = all_data['CPI'][post_covid_mask]
-
-pre_covid_corr_btc, pre_covid_pval_btc = pearsonr(pre_covid_btc, pre_covid_cpi)
-pre_covid_corr_gold, pre_covid_pval_gold = pearsonr(pre_covid_gold, pre_covid_cpi)
-post_covid_corr_btc, post_covid_pval_btc = pearsonr(post_covid_btc, post_covid_cpi)
-post_covid_corr_gold, post_covid_pval_gold = pearsonr(post_covid_gold, post_covid_cpi)
-
-print("\n" + "=" * 50)
-print("ENHANCED SUBPERIOD ANALYSIS (Pre-COVID vs Post-COVID)")
-print("=" * 50)
-print(f"Pre-COVID Bitcoin-Inflation Correlation: {pre_covid_corr_btc:.6f} (p-value: {pre_covid_pval_btc:.4f})")
-print(f"Pre-COVID Gold-Inflation Correlation: {pre_covid_corr_gold:.6f} (p-value: {pre_covid_pval_gold:.4f})")
-print(f"Post-COVID Bitcoin-Inflation Correlation: {post_covid_corr_btc:.6f} (p-value: {post_covid_pval_btc:.4f})")
-print(f"Post-COVID Gold-Inflation Correlation: {post_covid_corr_gold:.6f} (p-value: {post_covid_pval_gold:.4f})")
-
-
-def fisher_z_transform(r):
-    return 0.5 * np.log((1 + r) / (1 - r))
-
-
-def correlation_difference_test(r1, r2, n1, n2):
-    z1 = fisher_z_transform(r1)
-    z2 = fisher_z_transform(r2)
-    se = np.sqrt(1 / (n1 - 3) + 1 / (n2 - 3))
-    z = (z1 - z2) / se
-    p_value = 2 * (1 - stats.norm.cdf(abs(z)))
-    return z, p_value
-
-
-# Test Bitcoin correlation difference
-z_btc, p_btc = correlation_difference_test(pre_covid_corr_btc, post_covid_corr_btc, len(pre_covid_btc),
-                                           len(post_covid_btc))
-print(f"\nBitcoin correlation change (Pre vs Post COVID): z-stat={z_btc:.4f}, p-value={p_btc:.4f}")
-
-# Test Gold correlation difference
-z_gold, p_gold = correlation_difference_test(pre_covid_corr_gold, post_covid_corr_gold, len(pre_covid_gold),
-                                             len(post_covid_gold))
-print(f"Gold correlation change (Pre vs Post COVID): z-stat={z_gold:.4f}, p-value={p_gold:.4f}")
-
-plt.figure(figsize=(10, 6))
-plt.plot(pre_covid_btc.index, pre_covid_btc.rolling(180).corr(pre_covid_cpi), label='BTC-Inflation (Pre-COVID)',
-         linewidth=2)
-plt.plot(pre_covid_gold.index, pre_covid_gold.rolling(180).corr(pre_covid_cpi), label='Gold-Inflation (Pre-COVID)',
-         linewidth=2)
-plt.plot(post_covid_btc.index, post_covid_btc.rolling(180).corr(post_covid_cpi), label='BTC-Inflation (Post-COVID)',
-         linewidth=2)
-plt.plot(post_covid_gold.index, post_covid_gold.rolling(180).corr(post_covid_cpi), label='Gold-Inflation (Post-COVID)',
-         linewidth=2)
-plt.title('Figure 4.6: Bitcoin and Gold vs Inflation (Pre- and Post-COVID)', fontsize=14)
-plt.xlabel('Date')
-plt.ylabel('Rolling 6-Month Correlation')
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.savefig('figure4_6.png', dpi=300, bbox_inches='tight')
-plt.show()
-plt.close()
-
-# ==============================
-# ROBUSTNESS CHECKS AND SENSITIVITY ANALYSIS
-# ==============================
-
-print("\n" + "=" * 50)
-print("ROBUSTNESS CHECKS: SENSITIVITY ANALYSIS")
-print("=" * 50)
-
-# Test different jump detection thresholds
-thresholds = [2.5, 3.0, 3.5]
-print("Sensitivity of Merton parameters to jump detection threshold:")
-for threshold in thresholds:
-    jumps_thresh, _ = detect_jumps_robust(btc_returns, threshold=threshold)
-    lambda_thresh = len(jumps_thresh) / len(btc_returns)
-    alpha_thresh = float(np.mean(jumps_thresh)) if len(jumps_thresh) > 0 else 0
-    print(f"Threshold {threshold}: λ={lambda_thresh:.6f}, α={alpha_thresh:.6f}")
-
-# Test different GARCH specifications
-print("\nGARCH Model Robustness (Different Orders):")
-garch_orders = [(1, 1), (1, 2), (2, 1)]
-for order in garch_orders:
+    # 7. Create parameter comparison visualization
+    create_parameter_comparison_plot(gbm_params, jump_params, log_returns, jumps, non_jumps)
+
+    return metrics_df, gbm_params, jump_params
+
+def main_comprehensive_analysis():
+    """
+    Main function for comprehensive Bitcoin analysis.
+    Includes statistical modeling, correlation analysis, and hedging effectiveness.
+    """
+    print("\n\n" + "=" * 80)
+    print("EXECUTING COMPREHENSIVE ANALYSIS")
+    print("=" * 80)
+
+    # Date range for analysis
+    start_date = datetime.datetime(2015, 1, 1)
+    end_date = datetime.datetime(2024, 6, 30)
+
+    # ==============================
+    # DATA COLLECTION AND PREPROCESSING
+    # ==============================
+
+    print("Fetching Bitcoin data...")
+    btc = yf.download('BTC-USD', start=start_date, end=end_date, progress=False)
+
+    # Extract Bitcoin price and returns
+    if 'Adj Close' in btc.columns:
+        btc_prices = btc['Adj Close']
+    elif 'Close' in btc.columns:
+        btc_prices = btc['Close']
+    else:
+        btc_prices = btc.iloc[:, 0]
+
+    if isinstance(btc_prices, pd.DataFrame):
+        btc_prices = btc_prices.iloc[:, 0]
+
+    btc_returns = np.log(btc_prices / btc_prices.shift(1)).dropna()
+
+    # Fetch additional asset data for comparative analysis
+    print("Fetching Gold data...")
+    gold = yf.download('GC=F', start=start_date, end=end_date, progress=False)
+    gold_prices = gold['Adj Close'] if 'Adj Close' in gold.columns else gold['Close']
+    if isinstance(gold_prices, pd.DataFrame):
+        gold_prices = gold_prices.iloc[:, 0]
+    gold_returns = np.log(gold_prices / gold_prices.shift(1)).dropna()
+
+    print("Fetching additional macroeconomic data...")
+
+    # S&P 500 data
+    sp500 = yf.download('^GSPC', start=start_date, end=end_date, progress=False)
+    sp500_prices = sp500['Adj Close'] if 'Adj Close' in sp500.columns else sp500['Close']
+    if isinstance(sp500_prices, pd.DataFrame):
+        sp500_prices = sp500_prices.iloc[:, 0]
+    sp500_returns = np.log(sp500_prices / sp500_prices.shift(1)).dropna()
+
+    # US Dollar Index
+    dxy = yf.download('DX-Y.NYB', start=start_date, end=end_date, progress=False)
+    dxy_prices = dxy['Adj Close'] if 'Adj Close' in dxy.columns else dxy['Close']
+    if isinstance(dxy_prices, pd.DataFrame):
+        dxy_prices = dxy_prices.iloc[:, 0]
+    dxy_returns = np.log(dxy_prices / dxy_prices.shift(1)).dropna()
+
+    # Oil prices (WTI)
+    wti = yf.download('CL=F', start=start_date, end=end_date, progress=False)
+    wti_prices = wti['Adj Close'] if 'Adj Close' in wti.columns else wti['Close']
+    if isinstance(wti_prices, pd.DataFrame):
+        wti_prices = wti_prices.iloc[:, 0]
+    wti_returns = np.log(wti_prices / wti_prices.shift(1)).dropna()
+
+    # Fetch CPI inflation data from FRED
+    print("Fetching CPI data from FRED...")
     try:
-        garch_test = arch_model(residuals, vol='GARCH', p=order[0], q=order[1])
-        fit_garch_test = garch_test.fit(disp='off')
-        print(f"GARCH{order}: AIC={fit_garch_test.aic:.2f}, BIC={fit_garch_test.bic:.2f}")
-    except:
-        print(f"GARCH{order}: Failed to converge")
+        reader = FredReader(symbols="CPIAUCSL", start=start_date, end=end_date, api_key=FRED_API_KEY)
+        cpi = reader.read()
+
+        # Convert to monthly YoY inflation and interpolate to daily frequency
+        cpi_inflation = cpi.pct_change(12).dropna()
+        daily_dates = pd.date_range(start=start_date, end=end_date, freq='D')
+        cpi_daily = cpi_inflation.reindex(daily_dates).interpolate(method='time')
+        cpi_daily = cpi_daily.reindex(btc_returns.index).ffill().bfill()
+
+    except Exception as e:
+        print(f"Error fetching CPI data: {e}")
+        # Fallback to synthetic data if FRED fails
+        cpi_daily = pd.Series(np.random.normal(0.0001, 0.0005, len(btc_returns)),
+                              index=btc_returns.index)
+        print("Using synthetic inflation data for demonstration")
+
+    if isinstance(cpi_daily, pd.DataFrame):
+        cpi_daily = cpi_daily.iloc[:, 0]
+
+    # ==============================
+    # DATA ALIGNMENT
+    # ==============================
+
+    # Create unified dataset with all variables
+    all_data = pd.DataFrame({
+        'BTC': btc_returns,
+        'GOLD': gold_returns,
+        'SP500': sp500_returns,
+        'DXY': dxy_returns,
+        'WTI': wti_returns,
+        'CPI': cpi_daily
+    }).dropna()
+
+    # Extract aligned series
+    btc_returns = all_data['BTC']
+    gold_returns = all_data['GOLD']
+    sp500_returns = all_data['SP500']
+    dxy_returns = all_data['DXY']
+    wti_returns = all_data['WTI']
+    cpi_daily = all_data['CPI']
+
+    # ==============================
+    # JUMP DETECTION AND DESCRIPTIVE STATISTICS
+    # ==============================
+
+    print("\n" + "=" * 50)
+    print("ENHANCED JUMP DETECTION ANALYSIS")
+    print("=" * 50)
+
+    # Traditional jump detection (standard deviation)
+    std_return = float(np.std(btc_returns))
+    threshold_std = 3 * std_return
+    jumps_std = btc_returns[btc_returns.abs() > threshold_std]
+
+    # Robust jump detection (Median Absolute Deviation)
+    jumps_robust, jump_mask_robust = detect_jumps_robust(btc_returns, threshold=3)
+
+    print(f"Traditional method (3σ): {len(jumps_std)} jumps detected")
+    print(f"Robust method (3*MAD): {len(jumps_robust)} jumps detected")
+    print(f"Overlap between methods: {len(set(jumps_std.index) & set(jumps_robust.index))}")
+
+    # Use robust method results
+    jump_returns = jumps_robust
+    non_jump_returns = btc_returns[~jump_mask_robust]
+
+    # Calculate descriptive statistics
+    mean_return = float(np.mean(btc_returns))
+    skewness = float(stats.skew(btc_returns))
+    kurtosis = float(stats.kurtosis(btc_returns))
+    adf_result = adfuller(btc_returns)
+    adf_pvalue = adf_result[1]
+
+    num_large_jumps = len(jump_returns)
+    avg_jump_size = float(np.mean(jump_returns)) if num_large_jumps > 0 else 0
+
+    print("\nDescriptive Statistics for Bitcoin Returns:")
+    print(f"Mean Daily Return: {mean_return:.6f}")
+    print(f"Std Daily Return: {std_return:.6f}")
+    print(f"Number of Large Jumps: {num_large_jumps}")
+    print(f"Average Jump Size: {avg_jump_size:.6f}")
+    print(f"ADF p-value: {adf_pvalue:.6f}")
+    print(f"Skewness: {skewness:.3f}")
+    print(f"Kurtosis: {kurtosis:.3f}")
+
+    # ==============================
+    # MODEL PARAMETER ESTIMATION
+    # ==============================
+
+    # Enhanced GBM parameters (annualized)
+    gbm_params, _ = estimate_gbm_parameters(btc_prices)
+    mu_gbm = gbm_params['mu_mle']
+    sigma_gbm = gbm_params['sigma_mle']
+
+    print(f"\nENHANCED GBM PARAMETERS:")
+    print(f"Drift (μ): {mu_gbm:.6f}")
+    print(f"Volatility (σ): {sigma_gbm:.6f}")
+
+    # Enhanced Merton jump-diffusion parameters
+    jump_params, jumps, non_jumps = estimate_jump_diffusion_parameters(btc_returns)
+    lambda_jump = jump_params['lambda_mle']
+    alpha_jump = jump_params['mu_jump_mle']
+    delta_jump = jump_params['sigma_jump_mle']
+    mu_diffusion = jump_params['mu_mle']
+    sigma_diffusion = jump_params['sigma_mle']
+
+    print(f"\nENHANCED MERTON JUMP-DIFFUSION PARAMETERS:")
+    print(f"Drift (μ): {mu_diffusion:.6f}")
+    print(f"Volatility (σ): {sigma_diffusion:.6f}")
+    print(f"Jump Intensity (λ): {lambda_jump:.6f} (per year)")
+    print(f"Mean Jump Size (α): {alpha_jump:.6f}")
+    print(f"Jump Volatility (δ): {delta_jump:.6f}")
+    print(f"Number of Jumps Detected: {jump_params['n_jumps']}")
+    print(f"Jump Variance Contribution: {jump_params['jump_variance_ratio']:.2%}")
+
+    # ==============================
+    # TIME SERIES MODELING (ARIMA-GARCH)
+    # ==============================
+
+    print("\nFitting ARIMA-EGARCH model...")
+
+    # Plot ACF and PACF for ARIMA order selection
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    plot_acf(btc_returns, lags=30, ax=ax1)
+    plot_pacf(btc_returns, lags=30, ax=ax2)
+    plt.savefig('acf_pacf.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    plt.close()
+
+    # Fit ARIMA model
+    model = ARIMA(btc_returns, order=(1, 0, 1))
+    fit_arima = model.fit()
+    residuals = fit_arima.resid.dropna()
+
+    # Fit EGARCH model on ARIMA residuals
+    egarch = arch_model(residuals, vol='EGARCH', p=1, q=1, o=1)
+    fit_egarch = egarch.fit(disp='off')
+    print("EGARCH Model Results:")
+    print(fit_egarch.summary())
+
+    # Fit GJR-GARCH model for comparison
+    gjrgarch = arch_model(residuals, vol='GARCH', p=1, q=1, o=1)
+    fit_gjrgarch = gjrgarch.fit(disp='off')
+    print("\nGJR-GARCH Model Results:")
+    print(fit_gjrgarch.summary())
+
+    # ==============================
+    # COMPREHENSIVE MODEL COMPARISON
+    # ==============================
+
+    comparator = ModelComparator()
+
+    # Add GBM model
+    gbm_loglikelihood = calculate_gbm_loglikelihood(btc_returns, mu_gbm / 365, sigma_gbm / np.sqrt(365))
+    comparator.add_model('GBM', gbm_loglikelihood, n_params=2)
+
+    # Add Merton jump-diffusion model
+    merton_loglikelihood = calculate_merton_loglikelihood(
+        btc_returns,
+        mu_diffusion / 365,
+        sigma_diffusion / np.sqrt(365),
+        lambda_jump / 365,
+        alpha_jump,
+        delta_jump
+    )
+    comparator.add_model('Merton_Jump_Diffusion', merton_loglikelihood, n_params=5)
+
+    # Add GARCH family models
+    comparator.add_model('ARIMA-EGARCH', fit_egarch.loglikelihood, n_params=fit_egarch.num_params, model_obj=fit_egarch)
+    comparator.add_model('ARIMA-GJR-GARCH', fit_gjrgarch.loglikelihood, n_params=fit_gjrgarch.num_params,
+                         model_obj=fit_gjrgarch)
+
+    # Print comprehensive model comparison
+    comparator.print_comparison()
+
+    # ==============================
+    # CORRELATION AND HEDGING ANALYSIS
+    # ==============================
+
+    print("\n" + "=" * 50)
+    print("CORRELATION ANALYSIS WITH STATISTICAL SIGNIFICANCE")
+    print("=" * 50)
+
+    # Calculate correlations with statistical significance
+    corr_btc_infl, pval_btc_infl = pearsonr(btc_returns, cpi_daily)
+    corr_gold_infl, pval_gold_infl = pearsonr(gold_returns, cpi_daily)
+    corr_btc_gold, pval_btc_gold = pearsonr(btc_returns, gold_returns)
+    corr_btc_sp500, pval_btc_sp500 = pearsonr(btc_returns, sp500_returns)
+    corr_gold_sp500, pval_gold_sp500 = pearsonr(gold_returns, sp500_returns)
+
+    print("Correlation Analysis (with p-values):")
+    print(
+        f"BTC-Inflation: {corr_btc_infl:.6f} (p-value: {pval_btc_infl:.4f}) {'**' if pval_btc_infl < 0.05 else 'not significant'}")
+    print(
+        f"Gold-Inflation: {corr_gold_infl:.6f} (p-value: {pval_gold_infl:.4f}) {'**' if pval_gold_infl < 0.05 else 'not significant'}")
+    print(
+        f"BTC-Gold: {corr_btc_gold:.6f} (p-value: {pval_btc_gold:.4f}) {'**' if pval_btc_gold < 0.05 else 'not significant'}")
+    print(
+        f"BTC-S&P500: {corr_btc_sp500:.6f} (p-value: {pval_btc_sp500:.4f}) {'**' if pval_btc_sp500 < 0.05 else 'not significant'}")
+    print(
+        f"Gold-S&P500: {corr_gold_sp500:.6f} (p-value: {pval_gold_sp500:.4f}) {'**' if pval_gold_sp500 < 0.05 else 'not significant'}")
+
+    # Cointegration tests for long-term relationships
+    print("\nCointegration Test (Bitcoin vs Gold):")
+    coint_result = coint(btc_prices.reindex(gold_prices.index).dropna(),
+                         gold_prices.reindex(btc_prices.index).dropna())
+    print(f"p-value: {coint_result[1]:.6f}")
+
+    print("\nCointegration Test (Bitcoin vs Inflation):")
+    cpi_aligned = cpi_daily.reindex(btc_prices.index).dropna()
+    btc_aligned = btc_prices.reindex(cpi_aligned.index)
+    coint_result2 = coint(btc_aligned, cpi_aligned)
+    print(f"p-value: {coint_result2[1]:.6f}")
+
+    # ==============================
+    # VISUALIZATION 1: RETURN DISTRIBUTION HISTOGRAM
+    # ==============================
+
+    plt.figure(figsize=(12, 6))
+    plt.hist(btc_returns, bins=50, density=True, alpha=0.6, color='steelblue', label='Bitcoin Returns')
+    x = np.linspace(float(btc_returns.min()), float(btc_returns.max()), 100)
+    pdf = stats.norm.pdf(x, np.mean(btc_returns), np.std(btc_returns))
+    plt.plot(x, pdf, 'k-', linewidth=2, label='Normal Distribution')
+    plt.title('Figure 4.2(a): Histogram of Bitcoin Returns vs Normal Distribution', fontsize=14)
+    plt.xlabel('Daily Returns')
+    plt.ylabel('Density')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig('figure4_2a.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    plt.close()
+
+    # ==============================
+    # VISUALIZATION 2: JUMP ANALYSIS
+    # ==============================
+
+    plt.figure(figsize=(14, 10))
+
+    # Subplot 1: Bitcoin returns with jumps highlighted
+    plt.subplot(2, 1, 1)
+    plt.plot(btc_returns.index, btc_returns.values, color='blue', alpha=0.6, label='Bitcoin Returns')
+    plt.scatter(jump_returns.index, jump_returns.values, color='red', s=30, label='Detected Jumps', alpha=0.8)
+    plt.title('Figure 4.2(b): Bitcoin Daily Returns with Detected Jumps', fontsize=14)
+    plt.ylabel('Daily Returns')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # Subplot 2: Distribution comparison
+    plt.subplot(2, 1, 2)
+    plt.hist(non_jump_returns, bins=50, density=True, alpha=0.6, color='blue', label='Non-Jump Returns')
+    plt.hist(jump_returns, bins=20, density=True, alpha=0.6, color='red', label='Jump Returns')
+    x = np.linspace(-0.2, 0.2, 100)
+    pdf_normal = stats.norm.pdf(x, np.mean(non_jump_returns), np.std(non_jump_returns))
+    plt.plot(x, pdf_normal, 'k--', label='Normal Distribution', alpha=0.8)
+    plt.title('Distribution of Jump vs Non-Jump Returns', fontsize=12)
+    plt.xlabel('Returns')
+    plt.ylabel('Density')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('figure4_2b.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    plt.close()
+
+    # ==============================
+    # VISUALIZATION 3: Q-Q PLOT
+    # ==============================
+
+    plt.figure(figsize=(10, 6))
+    stats.probplot(btc_returns, dist="norm", plot=plt)
+    plt.title('Figure 4.3: Q-Q Plot of Bitcoin Returns vs Normal Distribution', fontsize=14)
+    plt.grid(True, alpha=0.3)
+    plt.savefig('figure4_3.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    plt.close()
+
+    # ==============================
+    # VISUALIZATION 4: CORRELATION HEATMAP
+    # ==============================
+
+    corr_data = pd.DataFrame({
+        'Bitcoin': btc_returns,
+        'Gold': gold_returns,
+        'S&P500': sp500_returns,
+        'USD Index': dxy_returns,
+        'Oil': wti_returns,
+        'Inflation': cpi_daily
+    })
+    corr_matrix = corr_data.corr()
+
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0,
+                square=True, fmt='.4f', cbar_kws={'label': 'Correlation Coefficient'})
+    plt.title('Figure 4.4: Correlation Heatmap Between Assets and Macroeconomic Factors', fontsize=14)
+    plt.savefig('figure4_4.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    plt.close()
+
+    # ==============================
+    # VISUALIZATION 5: SUBPERIOD ANALYSIS
+    # ==============================
+
+    covid_cutoff = datetime.datetime(2020, 3, 1)
+
+    pre_covid_mask = all_data.index < covid_cutoff
+    pre_covid_btc = all_data['BTC'][pre_covid_mask]
+    pre_covid_gold = all_data['GOLD'][pre_covid_mask]
+    pre_covid_cpi = all_data['CPI'][pre_covid_mask]
+
+    post_covid_mask = all_data.index >= covid_cutoff
+    post_covid_btc = all_data['BTC'][post_covid_mask]
+    post_covid_gold = all_data['GOLD'][post_covid_mask]
+    post_covid_cpi = all_data['CPI'][post_covid_mask]
+
+    pre_covid_corr_btc, pre_covid_pval_btc = pearsonr(pre_covid_btc, pre_covid_cpi)
+    pre_covid_corr_gold, pre_covid_pval_gold = pearsonr(pre_covid_gold, pre_covid_cpi)
+    post_covid_corr_btc, post_covid_pval_btc = pearsonr(post_covid_btc, post_covid_cpi)
+    post_covid_corr_gold, post_covid_pval_gold = pearsonr(post_covid_gold, post_covid_cpi)
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(pre_covid_btc.index, pre_covid_btc.rolling(180).corr(pre_covid_cpi), label='BTC-Inflation (Pre-COVID)',
+             linewidth=2)
+    plt.plot(pre_covid_gold.index, pre_covid_gold.rolling(180).corr(pre_covid_cpi), label='Gold-Inflation (Pre-COVID)',
+             linewidth=2)
+    plt.plot(post_covid_btc.index, post_covid_btc.rolling(180).corr(post_covid_cpi), label='BTC-Inflation (Post-COVID)',
+             linewidth=2)
+    plt.plot(post_covid_gold.index, post_covid_gold.rolling(180).corr(post_covid_cpi), label='Gold-Inflation (Post-COVID)',
+             linewidth=2)
+    plt.title('Figure 4.5: Bitcoin and Gold vs Inflation (Pre- and Post-COVID)', fontsize=14)
+    plt.xlabel('Date')
+    plt.ylabel('Rolling 113-Month Correlation')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig('figure4_5.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    plt.close()
+
+    # ==============================
+    # VISUALIZATION 6: ROLLING CORRELATIONS
+    # ==============================
+
+    window_size = 365  # 1-year rolling window
+    rolling_corr_btc_infl = btc_returns.rolling(window=window_size).corr(cpi_daily)
+    rolling_corr_gold_infl = gold_returns.rolling(window=window_size).corr(cpi_daily)
+    rolling_corr_btc_gold = btc_returns.rolling(window=window_size).corr(gold_returns)
+
+    plt.figure(figsize=(14, 8))
+    plt.plot(rolling_corr_btc_infl.index, rolling_corr_btc_infl.values, label='BTC-Inflation', linewidth=2)
+    plt.plot(rolling_corr_gold_infl.index, rolling_corr_gold_infl.values, label='Gold-Inflation', linewidth=2)
+    plt.plot(rolling_corr_btc_gold.index, rolling_corr_btc_gold.values, label='BTC-Gold', linewidth=2)
+    plt.title('Figure 4.6: Rolling Correlations (9-Year Window)', fontsize=14)
+    plt.xlabel('Date')
+    plt.ylabel('Correlation')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig('figure4_6.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    plt.close()
+
+    # ==============================
+    # HEDGING EFFECTIVENESS ANALYSIS
+    # ==============================
+
+    cov_btc = np.cov(btc_returns, cpi_daily)[0, 1]
+    var_pi = np.var(cpi_daily)
+    hr_btc = cov_btc / var_pi
+
+    cov_gold = np.cov(gold_returns, cpi_daily)[0, 1]
+    hr_gold = cov_gold / var_pi
+
+    eff_btc = 1 - np.var(btc_returns - hr_btc * cpi_daily) / np.var(btc_returns)
+    eff_gold = 1 - np.var(gold_returns - hr_gold * cpi_daily) / np.var(gold_returns)
+
+    print("\n" + "=" * 50)
+    print("HEDGING EFFECTIVENESS ANALYSIS")
+    print("=" * 50)
+    print(f"Bitcoin Correlation with Inflation: {corr_btc_infl:.6f} (p-value: {pval_btc_infl:.4f})")
+    print(f"Gold Correlation with Inflation: {corr_gold_infl:.6f} (p-value: {pval_gold_infl:.4f})")
+    print(f"Bitcoin Hedge Ratio: {hr_btc:.6f}")
+    print(f"Gold Hedge Ratio: {hr_gold:.6f}")
+    print(f"Bitcoin Hedging Effectiveness: {eff_btc:.6f} ({eff_btc * 100:.4f}%)")
+    print(f"Gold Hedging Effectiveness: {eff_gold:.6f} ({eff_gold * 100:.4f}%)")
+
+    # Statistical test for hedging effectiveness difference
+    hedged_btc = btc_returns - hr_btc * cpi_daily
+    hedged_gold = gold_returns - hr_gold * cpi_daily
+    t_stat, p_val = ttest_ind(hedged_btc, hedged_gold, equal_var=False)
+    print(f"T-test for hedging effectiveness difference: t-stat={t_stat:.4f}, p-value={p_val:.4f}")
+
+    # Fisher's z-transform for correlation difference testing
+    def fisher_z_transform(r):
+        return 0.5 * np.log((1 + r) / (1 - r))
+
+    def correlation_difference_test(r1, r2, n1, n2):
+        z1 = fisher_z_transform(r1)
+        z2 = fisher_z_transform(r2)
+        se = np.sqrt(1 / (n1 - 3) + 1 / (n2 - 3))
+        z = (z1 - z2) / se
+        p_value = 2 * (1 - stats.norm.cdf(abs(z)))
+        return z, p_value
+
+    # Test Bitcoin correlation difference
+    z_btc, p_btc = correlation_difference_test(pre_covid_corr_btc, post_covid_corr_btc, len(pre_covid_btc),
+                                               len(post_covid_btc))
+    print(f"\nBitcoin correlation change (Pre vs Post COVID): z-stat={z_btc:.4f}, p-value={p_btc:.4f}")
+
+    # Test Gold correlation difference
+    z_gold, p_gold = correlation_difference_test(pre_covid_corr_gold, post_covid_corr_gold, len(pre_covid_gold),
+                                                 len(post_covid_gold))
+    print(f"Gold correlation change (Pre vs Post COVID): z-stat={z_gold:.4f}, p-value={p_gold:.4f}")
+
+    # ==============================
+    # ROBUSTNESS CHECKS
+    # ==============================
+
+    print("\n" + "=" * 50)
+    print("ROBUSTNESS CHECKS: SENSITIVITY ANALYSIS")
+    print("=" * 50)
+
+    # Test different jump detection thresholds
+    thresholds = [2.5, 3.0, 3.5]
+    print("Sensitivity of Merton parameters to jump detection threshold:")
+    for threshold in thresholds:
+        jumps_thresh, _ = detect_jumps_robust(btc_returns, threshold=threshold)
+        lambda_thresh = len(jumps_thresh) / len(btc_returns) * 365
+        alpha_thresh = float(np.mean(jumps_thresh)) if len(jumps_thresh) > 0 else 0
+        print(f"Threshold {threshold}: λ={lambda_thresh:.6f}, α={alpha_thresh:.6f}")
+
+    print("\nAnalysis complete. All figures saved as PNG files.")
+    print("\nKEY FINDINGS:")
+    print(f"- Best model according to AIC: {comparator.results.iloc[0]['Model']}")
+    print(
+        f"- Bitcoin-Inflation correlation: {corr_btc_infl:.6f} (statistically {'significant' if pval_btc_infl < 0.05 else 'not significant'})")
+    print(
+        f"- Gold-Inflation correlation: {corr_gold_infl:.6f} (statistically {'significant' if pval_gold_infl < 0.05 else 'not significant'})")
+    print(f"- Hedging effectiveness: Bitcoin {eff_btc * 100:.4f}%, Gold {eff_gold * 100:.4f}%")
+
+    return comparator.results
 
 # ==============================
-# FINAL SUMMARY AND CONCLUSIONS
+# MAIN EXECUTION
 # ==============================
 
-print("\nAnalysis complete. All figures saved as PNG files.")
-print("\nKEY FINDINGS:")
-print(f"- Best model according to AIC: {comparator.results.iloc[0]['Model']}")
-print(
-    f"- Bitcoin-Inflation correlation: {corr_btc_infl:.6f} (statistically {'significant' if pval_btc_infl < 0.05 else 'not significant'})")
-print(
-    f"- Gold-Inflation correlation: {corr_gold_infl:.6f} (statistically {'significant' if pval_gold_infl < 0.05 else 'not significant'})")
-print(f"- Hedging effectiveness: Bitcoin {eff_btc * 100:.4f}%, Gold {eff_gold * 100:.4f}%")
-print(f"- CPI data accuracy confirmed: June 2024 CPI = {cpi_data.iloc[-1]['CPIAUCSL']:.1f}")
-print(f"- Inflation data accuracy confirmed: Peak inflation = {cpi_yoy['CPIAUCSL'].max():.1f}%")
+if __name__ == "__main__":
+    """
+    Main execution block that runs both the simulation study and comprehensive analysis.
+    """
 
-print("\n" + "=" * 80)
-print("ANALYSIS COMPLETE - ALL CHARTS AND METRICS GENERATED")
-print("=" * 80)
+    # Run enhanced Bitcoin simulation models with comprehensive parameter estimation
+    simulation_results, gbm_params, jump_params = main_bitcoin_simulation_enhanced()
+
+    # Run comprehensive statistical analysis
+    analysis_results = main_comprehensive_analysis()
+
+    print("\n" + "=" * 80)
+    print("ENHANCED ANALYSIS COMPLETE")
+    print("=" * 80)
+    print("All models have been evaluated with comprehensive parameter estimation.")
+    print("Parameter visualizations and comparisons have been saved.")
+    print("Check the generated PNG files for detailed charts and figures.")
+
+    # Final parameter summary
+    print("\n" + "=" * 80)
+    print("FINAL PARAMETER SUMMARY")
+    print("=" * 80)
+    print_parameter_summary(gbm_params, jump_params)
